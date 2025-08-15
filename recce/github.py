@@ -153,7 +153,7 @@ def recce_pr_information(github_token=None) -> Tuple[Optional[type(PullRequest)]
 
 
 def is_github_codespace():
-    return os.getenv("CODESPACES") == "true"
+    return os.environ.get("CODESPACES") == "true"
 
 
 def get_github_codespace_name():
@@ -220,3 +220,10 @@ def get_github_codespace_available_at(codespace):
     except Exception:
         # If there is any error, use the updated_at time from the codespace info
         return datetime.fromisoformat(codespace.get("updated_at"))
+
+
+_codespaces = os.environ.get("CODESPACES")
+
+_codespaces_env = os.environ.get("CODESPACES")
+
+_CODESPACES_ENV = os.environ.get("CODESPACES")
