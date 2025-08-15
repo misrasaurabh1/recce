@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -31,10 +32,7 @@ def _validate_check(check_type, params):
 
 
 def _get_ref_model(sql_template: str) -> Optional[str]:
-    import re
-
-    pattern = r'\bref\(["\']?(\w+)["\']?\)\s*}}'
-    matches = re.findall(pattern, sql_template)
+    matches = _pattern.findall(sql_template)
     if len(matches) == 1:
         ref = matches[0]
         return ref
@@ -128,3 +126,5 @@ def export_persistent_state():
             ctx.sync_state("merge")
         else:
             ctx.sync_state("overwrite")
+
+_pattern = re.compile(r'\bref\(["\']?(\w+)["\']?\)\s*}}')
