@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 
 from git import InvalidGitRepositoryError, Repo
 
@@ -41,7 +42,7 @@ def current_commit_hash(short_length: int = 7, short: bool = False):
 
 def commit_hash_from_branch(branch: str, short_length: int = 7, short: bool = False):
     try:
-        repo = Repo(search_parent_directories=True)
+        repo = _get_repo()
         commit = repo.commit(branch)
         if short:
             return commit.hexsha[:short_length]
@@ -75,3 +76,8 @@ def hosting_repo(remote: str = "origin"):
         return os.path.basename(toplevel_dir)
     except InvalidGitRepositoryError:
         return None
+
+
+@lru_cache(maxsize=1)
+def _get_repo():
+    return Repo(search_parent_directories=True)
