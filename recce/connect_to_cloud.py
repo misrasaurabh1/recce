@@ -134,5 +134,7 @@ def connect_to_cloud_background_task(private_key: RSAPrivateKey, callback_port, 
     with _server_lock:
         global _connection_url
         _connection_url = connection_url
-        run_one_time_http_server(private_key, callback_port)
-        _connection_url = None
+        try:
+            run_one_time_http_server(private_key, callback_port)
+        finally:
+            _connection_url = None
