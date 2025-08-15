@@ -16,6 +16,7 @@ from recce.state import (
     RecceStateMetadata,
 )
 from recce.util.recce_cloud import set_recce_cloud_onboarding_state
+from operator import attrgetter
 
 logger = logging.getLogger("uvicorn")
 
@@ -214,16 +215,12 @@ class RecceContext:
     def _merge_runs(self, import_runs: list[Run]):
         runs = list(self.runs)
         run_set = {run.run_id for run in self.runs}
-        imports = 0
+        new_runs = [run for run in import_runs if run.run_id not in run_set]
 
-        for run in import_runs:
-            if run.run_id not in run_set:
-                runs.append(run)
-                imports += 1
-
-        runs.sort(key=lambda x: x.run_at)
+        runs.extend(new_runs)
+        runs.sort(key=attrgetter("run_at"))
         self.runs = runs
-        return imports
+        return len(new_runs)
 
     def import_state(self, import_state: RecceState, merge: bool = True):
         """
