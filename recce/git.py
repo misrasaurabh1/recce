@@ -6,6 +6,14 @@ from git import InvalidGitRepositoryError, Repo
 def current_default_branch():
     try:
         repo = Repo(search_parent_directories=True)
+        origin_head_ref = f"{repo.git_dir}/refs/remotes/origin/HEAD"
+        try:
+            with open(origin_head_ref, "r") as f:
+                ref_line = f.readline().strip()
+            if ref_line.startswith("ref:"):
+                return ref_line.partition("refs/remotes/origin/")[2] or None
+        except FileNotFoundError:
+            pass
         return repo.remotes.origin.refs["HEAD"].reference.remote_head
     except Exception:
         return None
