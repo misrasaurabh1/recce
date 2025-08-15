@@ -77,13 +77,6 @@ def schema_diff_should_be_approved(check_params: dict) -> bool:
 
         selected_node_ids = [node for node in selected_node_ids if not node.startswith("test.")]
 
-        def _get_selected_node_columns_from_lineage(lineage, node_ids: list[str]):
-            nodes = {}
-            for node_id, node in lineage.get("nodes", {}).items():
-                if node_id in node_ids:
-                    nodes[node_id] = node.get("columns", {})
-            return nodes
-
         base_nodes = _get_selected_node_columns_from_lineage(context.get_lineage(base=True), selected_node_ids)
         curr_nodes = _get_selected_node_columns_from_lineage(context.get_lineage(base=False), selected_node_ids)
         diff = DeepDiff(base_nodes, curr_nodes, ignore_order=True)
@@ -375,3 +368,11 @@ async def cli_run(output_state_file: str, **kwargs):
         console.print(f"The summary is stored at '{summary_path}'")
 
     return rc
+
+def _get_selected_node_columns_from_lineage(lineage, node_ids: list[str]):
+    node_id_set = set(node_ids)
+    nodes = {}
+    for node_id, node in lineage.get("nodes", {}).items():
+        if node_id in node_id_set:
+            nodes[node_id] = node.get("columns", {})
+    return nodes
