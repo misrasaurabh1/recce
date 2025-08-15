@@ -6,19 +6,19 @@ from recce.core import default_context
 from recce.exceptions import RecceException
 from recce.models import Run, RunDAO, RunType
 from recce.models.types import RunStatus
+import re
 
 running_tasks = {}
 logger = logging.getLogger("uvicorn")
 
 
 def _get_ref_model(sql_template: str) -> Optional[str]:
-    import re
-
-    pattern = r'\bref\(["\']?(\w+)["\']?\)\s*}}'
-    matches = re.findall(pattern, sql_template)
-    if len(matches) == 1:
-        ref = matches[0]
-        return ref
+    match = _pattern_compiled.search(sql_template)
+    if match:
+        second_match = _pattern_compiled.search(sql_template, match.end())
+        if not second_match:
+            ref = match.group(1)
+            return ref
 
     return None
 
@@ -226,3 +226,6 @@ def materialize_run_results(runs: List[Run], nodes: List[str] = None):
                     node_result = result.get(key)
                 node_result["row_count"] = {"run_id": run.run_id, "result": node_run_result}
     return result
+
+
+_pattern_compiled = re.compile(r'\bref\(["\']?(\w+)["\']?\)\s*}}')
