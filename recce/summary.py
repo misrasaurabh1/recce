@@ -134,7 +134,7 @@ class Node:
                     # Skip the row count and schema diff check, since we already have it.
                     continue
                 if check.node_ids and self.id in check.node_ids:
-                    changes.append(str(check.type).replace("_", " ").title())
+                    changes.append(str(check_type).replace("_", " ").title())
         return changes
 
     def get_node_str(self, checks=None):
@@ -145,10 +145,12 @@ class Node:
             is_changed = True
             if self.change_status == "added":
                 style = f"style {self.id} stroke:{ADD_COLOR}"
+                return f'{self.id}["{self.name}\n\n[What\'s Changed]\nAdded Node"]\n{style}\n'
             elif self.change_status == "modified":
                 style = f"style {self.id} stroke:{MODIFIED_COLOR}"
             elif self.change_status == "removed":
                 style = f"style {self.id} stroke:{REMOVE_COLOR}"
+                return f'{self.id}["{self.name}\n\n[What\'s Changed]\nRemoved Node"]\n{style}\n'
 
         if checks:
             for check in checks:
