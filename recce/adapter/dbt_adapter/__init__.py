@@ -35,6 +35,8 @@ from recce.util.perf_tracking import LineagePerfTracker
 
 from ...tasks.profile import ProfileTask
 from ...util.breaking import BreakingPerformanceTracking, parse_change_category
+from recce.adapter.base import BaseAdapter
+from recce.models.types import CllColumn, CllNode
 
 try:
     import agate
@@ -1320,8 +1322,8 @@ class DbtAdapter(BaseAdapter):
         node = None
 
         # model, seed, snapshot
-        if node_id in manifest.nodes:
-            found = manifest.nodes[node_id]
+        found = manifest.nodes.get(node_id)
+        if found is not None:
             unique_id = found.unique_id
             node = CllNode.build_cll_node(manifest, "nodes", node_id)
             if hasattr(found.depends_on, "nodes"):
@@ -1336,8 +1338,8 @@ class DbtAdapter(BaseAdapter):
                 node.columns = columns
 
         # source
-        if node_id in manifest.sources:
-            found = manifest.sources[node_id]
+        found = manifest.sources.get(node_id)
+        if found is not None:
             unique_id = found.unique_id
             node = CllNode.build_cll_node(manifest, "sources", node_id)
             parent_list = []
@@ -1351,20 +1353,21 @@ class DbtAdapter(BaseAdapter):
                 node.columns = columns
 
         # exposure
-        if node_id in manifest.exposures:
-            found = manifest.exposures[node_id]
+        found = manifest.exposures.get(node_id)
+        if found is not None:
             node = CllNode.build_cll_node(manifest, "exposures", node_id)
             if hasattr(found.depends_on, "nodes"):
                 parent_list = found.depends_on.nodes
 
-        if hasattr(manifest, "semantic_models") and node_id in manifest.semantic_models:
-            found = manifest.semantic_models[node_id]
-            node = CllNode.build_cll_node(manifest, "semantic_models", node_id)
-            if hasattr(found.depends_on, "nodes"):
-                parent_list = found.depends_on.nodes
+        if hasattr(manifest, "semantic_models"):
+            found = manifest.semantic_models.get(node_id)
+            if found is not None:
+                node = CllNode.build_cll_node(manifest, "semantic_models", node_id)
+                if hasattr(found.depends_on, "nodes"):
+                    parent_list = found.depends_on.nodes
 
-        if node_id in manifest.metrics:
-            found = manifest.metrics[node_id]
+        found = manifest.metrics.get(node_id)
+        if found is not None:
             node = CllNode.build_cll_node(manifest, "metrics", node_id)
             if hasattr(found.depends_on, "nodes"):
                 parent_list = found.depends_on.nodes

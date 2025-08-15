@@ -157,10 +157,10 @@ class CllNode(BaseModel):
     @classmethod
     def build_cll_node(cls, manifest, resource_key, node_id) -> Optional["CllNode"]:
         resources = getattr(manifest, resource_key)
-        if node_id not in resources:
+        n = resources.get(node_id)
+        if n is None:
             return None
-        n = resources[node_id]
-        if resource_key == "nodes" and n.resource_type not in ["model", "seed", "snapshot"]:
+        if resource_key == "nodes" and n.resource_type not in ("model", "seed", "snapshot"):
             return None
         cll_node = CllNode(
             id=n.unique_id,
