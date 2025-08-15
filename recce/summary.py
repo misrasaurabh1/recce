@@ -506,11 +506,15 @@ def generate_check_content(graph, check_statistics):
     # Generate the check summary if we found any changes
     if len(graph.checks) > 0:
         data = []
+        type_cache = {}
         for check in graph.checks:
+            check_type = check.type
+            if check_type not in type_cache:
+                type_cache[check_type] = str(check_type).replace("_", " ").title()
             data.append(
                 {
                     "Name": check.name,
-                    "Type": str(check.type).replace("_", " ").title(),
+                    "Type": type_cache[check_type],
                     "Mismatched Nodes": _generate_mismatched_nodes_summary(check),
                     # Temporarily remove the type of changes, until we implement a better way to display it.
                     # 'Type of Changes': _formate_changes(check.changes)
