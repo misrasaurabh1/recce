@@ -22,15 +22,20 @@ def is_ci_env():
         "AZURE_PIPELINES": "true",  # Azure Pipelines
     }
 
+    environ = os.environ
+
+    # Avoid function call overhead by directly using environ.__getitem__ in try/except
     for env_var, expected_value in ci_environments.items():
-        env_value = os.environ.get(env_var)
-        if env_value is not None:
-            # If we just need the variable to exist
-            if expected_value is None:
-                return True
-            # If we need to match a specific value (case-insensitive)
-            if env_value.lower() == expected_value.lower():
-                return True
+        try:
+            env_value = environ[env_var]
+        except KeyError:
+            continue
+        # If we just need the variable to exist
+        if expected_value is None:
+            return True
+        # If we need to match a specific value (case-insensitive)
+        if env_value.lower() == expected_value.lower():
+            return True
 
     return False
 
