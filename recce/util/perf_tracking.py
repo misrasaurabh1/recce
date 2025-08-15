@@ -59,15 +59,17 @@ class LineagePerfTracker:
         }
 
     def to_dict(self):
+        # Using a local variable for the instance attribute lookup, to slightly speed up repeated access
+        self_ = self
         return {
-            "lineage_elapsed_ms": self.lineage_elapsed,
-            "column_lineage_elapsed_ms": self.column_lineage_elapsed,
-            "total_nodes": self.total_nodes,
-            "init_nodes": self.init_nodes,
-            "cll_nodes": self.cll_nodes,
-            "change_analysis_nodes": self.change_analysis_nodes,
-            "anchor_nodes": self.anchor_nodes,
-            "params": self.params,
+            "lineage_elapsed_ms": self_.lineage_elapsed,
+            "column_lineage_elapsed_ms": self_.column_lineage_elapsed,
+            "total_nodes": self_.total_nodes,
+            "init_nodes": self_.init_nodes,
+            "cll_nodes": self_.cll_nodes,
+            "change_analysis_nodes": self_.change_analysis_nodes,
+            "anchor_nodes": self_.anchor_nodes,
+            "params": self_.params,
         }
 
     def reset(self):
