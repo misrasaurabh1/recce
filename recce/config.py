@@ -88,8 +88,6 @@ class RecceConfig(metaclass=SingletonMeta):
                 )
 
     def generate_template(self):
-        data = yaml.CommentedMap(checks=yaml.CommentedSeq())
-        data.yaml_set_comment_before_after_key("checks", before=RECCE_PRESET_CHECK_COMMENT)
         # Define default preset checks
         default_checks = [
             yaml.CommentedMap(
@@ -105,9 +103,8 @@ class RecceConfig(metaclass=SingletonMeta):
             ),
         ]
 
-        for check in default_checks:
-            data["checks"].append(check)
-
+        data = yaml.CommentedMap(checks=yaml.CommentedSeq(default_checks))
+        data.yaml_set_comment_before_after_key("checks", before=RECCE_PRESET_CHECK_COMMENT)
         return data
 
     def get(self, key, default=None):
