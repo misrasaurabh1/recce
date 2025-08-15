@@ -13,10 +13,10 @@ def pydantic_model_json_dump(model: BaseModel):
 
 
 def pydantic_model_dump(model: BaseModel):
-    pydantic_version = pydantic.version.VERSION
-    pydantic_major = pydantic_version.split(".")[0]
-
-    if pydantic_major == "1":
+    if _pydantic_major == "1":
         return model.dict()
     else:
         return model.model_dump()
+
+
+_pydantic_major = pydantic.version.VERSION.split(".")[0]
