@@ -99,7 +99,9 @@ class RecceCloud:
         self, repository: str, artifact_name: str, branch: str = None
     ) -> (str, dict):
         response = self._fetch_presigned_url(PresignedUrlMethod.DOWNLOAD, repository, artifact_name, branch=branch)
-        return response.get("presigned_url"), response.get("tags", {})
+        presigned_url = response["presigned_url"] if "presigned_url" in response else None
+        tags = response["tags"] if "tags" in response else {}
+        return presigned_url, tags
 
     def _fetch_presigned_url(
         self,
@@ -116,7 +118,10 @@ class RecceCloud:
             api_url = f"{self.base_url}/{repository}/commits/{branch}/artifacts/{method}?artifact_name={artifact_name}&enable_ssec=true"
         else:
             raise ValueError("Either pr_id or sha must be provided.")
-        response = self._request("POST", api_url, json=metadata)
+        if metadata is not None:
+            response = self._request("POST", api_url, json=metadata)
+        else:
+            response = self._request("POST", api_url)
         if response.status_code != 200:
             raise RecceCloudException(
                 message="Failed to {method} artifact {preposition} Recce Cloud.".format(
