@@ -5,6 +5,7 @@ import sys
 import threading
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from hashlib import sha256
 from typing import Dict
 
@@ -14,12 +15,9 @@ from recce import get_runner, get_version, is_ci_env
 from recce import yaml as pyml
 from recce.event.collector import Collector
 from recce.git import current_branch, hosting_repo
-from recce.github import (
-    get_github_codespace_available_at,
-    get_github_codespace_info,
-    get_github_codespace_name,
-    is_github_codespace,
-)
+from recce.github import (get_github_codespace_available_at,
+                          get_github_codespace_info, get_github_codespace_name,
+                          is_github_codespace)
 
 USER_HOME = os.path.expanduser("~")
 RECCE_USER_HOME = os.path.join(USER_HOME, ".recce")
@@ -60,6 +58,7 @@ def init():
     sentry_sdk.set_tag("system_timezone", get_system_timezone())
 
 
+@lru_cache(maxsize=1)
 def get_user_id():
     return load_user_profile().get("user_id")
 
@@ -72,6 +71,7 @@ def update_recce_api_token(token):
     return update_user_profile({"api_token": token})
 
 
+@lru_cache(maxsize=1)
 def is_anonymous_tracking():
     return load_user_profile().get("anonymous_tracking", False)
 
