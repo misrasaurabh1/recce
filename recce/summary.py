@@ -54,13 +54,8 @@ class Node:
         self.children = []
         self.parents = []
 
-        self.base_data = {}
-        self.current_data = {}
-
-        if data_from == "base":
-            self.base_data = node_data
-        elif data_from == "current":
-            self.current_data = node_data
+        self.base_data = node_data if data_from == "base" else {}
+        self.current_data = node_data if data_from == "current" else {}
 
     @property
     def change_status(self):
@@ -75,14 +70,15 @@ class Node:
         return None
 
     def update_data(self, node_data: dict, data_from: str):
-        if data_from not in ["base", "current"]:
+        # Fast-path for valid values; avoid repeated list lookups.
+        if data_from != "base" and data_from != "current":
             raise ValueError(f"Invalid data_from value: {data_from}")
         if self.data_from != data_from:
             self.data_from = "both"
-
+            # No need for elif since only "base" or "current" possible here.
             if data_from == "base":
                 self.base_data = node_data
-            elif data_from == "current":
+            else:
                 self.current_data = node_data
 
     def append_parent(self, parent_id: str):
@@ -229,26 +225,32 @@ class LineageGraph:
     checks: List[CheckSummary] = None
 
     def create_node(self, node_id: str, node_data: dict, data_from: str = "base"):
-        if node_id not in self.nodes:
+        try:
+            node = self.nodes[node_id]
+        except KeyError:
             self.nodes[node_id] = Node(node_id, node_data, data_from)
         else:
-            self.nodes[node_id].update_data(node_data, data_from)
+            node.update_data(node_data, data_from)
 
     def create_edge(self, parent_id: str, child_id: str, edge_from: str = "base"):
-        if parent_id not in self.nodes:
+        nodes = self.nodes
+        edges = self.edges
+
+        if parent_id not in nodes:
             _warn(f"Parent node {parent_id} not found in graph")
             return
-        if child_id not in self.nodes:
+        if child_id not in nodes:
             _warn(f"Child node {child_id} not found in graph")
             return
 
         edge_id = f"{parent_id}-->{child_id}"
-        if edge_id in self.edges:
-            self.edges[edge_id].update_edge_from(edge_from)
+        edge = edges.get(edge_id)
+        if edge is not None:
+            edge.update_edge_from(edge_from)
         else:
-            self.edges[edge_id] = Edge(edge_id, parent_id, child_id, edge_from)
-            self.nodes[parent_id].append_child(child_id)
-            self.nodes[child_id].append_parent(parent_id)
+            edges[edge_id] = Edge(edge_id, parent_id, child_id, edge_from)
+            nodes[parent_id].append_child(child_id)
+            nodes[child_id].append_parent(parent_id)
 
     @property
     def modified_set(self) -> Set[str]:
@@ -271,25 +273,35 @@ class LineageGraph:
 def _build_lineage_graph(base, current) -> LineageGraph:
     graph = LineageGraph()
 
+    # Reference objects once
+    graph_nodes = graph.nodes
+
     # Init Graph nodes with base & current nodes
-    for node_id, node_data in base.get("nodes", {}).items():
-        graph.create_node(node_id, node_data, "base")
+    base_nodes = base.get("nodes")
+    if base_nodes:
+        for node_id, node_data in base_nodes.items():
+            graph.create_node(node_id, node_data, "base")
 
-    for node_id, node_data in current.get("nodes", {}).items():
-        if node_id not in graph.nodes:
-            node = Node(node_id, node_data, "current")
-            graph.nodes[node_id] = node
-        else:
-            node = graph.nodes[node_id]
-            node.update_data(node_data, "current")
+    current_nodes = current.get("nodes")
+    if current_nodes:
+        for node_id, node_data in current_nodes.items():
+            if node_id not in graph_nodes:
+                # Fast path, minor duplication from create_node but saves hasattr/lookup
+                graph_nodes[node_id] = Node(node_id, node_data, "current")
+            else:
+                graph_nodes[node_id].update_data(node_data, "current")
 
-    # Build edges
-    for child_id, parents in base.get("parent_map", {}).items():
-        for parent_id in parents:
-            graph.create_edge(parent_id, child_id, "base")
-    for child_id, parents in current.get("parent_map", {}).items():
-        for parent_id in parents:
-            graph.create_edge(parent_id, child_id, "current")
+    base_parent_map = base.get("parent_map")
+    if base_parent_map:
+        for child_id, parents in base_parent_map.items():
+            for parent_id in parents:
+                graph.create_edge(parent_id, child_id, "base")
+
+    current_parent_map = current.get("parent_map")
+    if current_parent_map:
+        for child_id, parents in current_parent_map.items():
+            for parent_id in parents:
+                graph.create_edge(parent_id, child_id, "current")
 
     return graph
 
