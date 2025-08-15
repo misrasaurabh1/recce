@@ -9,6 +9,7 @@ import requests
 from github import Artifact, Auth, Github, PullRequest, UnknownObjectException
 
 from recce.git import current_branch, hosting_repo
+import shutil
 
 
 def download_artifact(github_token: str, artifact: Artifact) -> List[str]:
@@ -20,9 +21,17 @@ def download_artifact(github_token: str, artifact: Artifact) -> List[str]:
     }
     r = requests.get(artifact.archive_download_url, headers=headers)
     r.raise_for_status()
-    z = zipfile.ZipFile(io.BytesIO(r.content))
-    z.extractall()
-    return z.namelist()
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        for name in z.namelist():
+            if name.endswith("/"):
+                os.makedirs(name, exist_ok=True)
+                continue
+            parent = os.path.dirname(name)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with z.open(name) as src, open(name, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+        return z.namelist()
 
 
 def recce_ci_artifact(**kwargs):
