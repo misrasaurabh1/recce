@@ -157,7 +157,7 @@ def is_github_codespace():
 
 
 def get_github_codespace_name():
-    return os.getenv("CODESPACE_NAME")
+    return os.environ.get("CODESPACE_NAME")
 
 
 def get_github_codespace_info():
@@ -220,3 +220,8 @@ def get_github_codespace_available_at(codespace):
     except Exception:
         # If there is any error, use the updated_at time from the codespace info
         return datetime.fromisoformat(codespace.get("updated_at"))
+
+
+_codespace_name = os.environ.get("CODESPACE_NAME")
+
+_environ_get = os.environ.get
