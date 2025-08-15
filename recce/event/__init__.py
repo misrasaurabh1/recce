@@ -65,11 +65,21 @@ def get_user_id():
 
 
 def get_recce_api_token():
-    return load_user_profile().get("api_token")
+    # Use cached user profile to avoid repeated file reads
+    global _user_profile_cache
+    with _user_profile_lock:
+        if _user_profile_cache is None:
+            _user_profile_cache = load_user_profile()
+        return _user_profile_cache.get("api_token")
 
 
 def update_recce_api_token(token):
-    return update_user_profile({"api_token": token})
+    # Update user profile (and reset cache)
+    global _user_profile_cache
+    result = update_user_profile({"api_token": token})
+    with _user_profile_lock:
+        _user_profile_cache = result
+    return result
 
 
 def is_anonymous_tracking():
@@ -301,3 +311,8 @@ def set_exception_tag(key, value):
 
 def get_system_timezone():
     return datetime.now(timezone.utc).astimezone().tzinfo
+
+
+_user_profile_cache = None
+
+_user_profile_lock = threading.Lock()
