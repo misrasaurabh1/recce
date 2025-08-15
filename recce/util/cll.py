@@ -32,9 +32,11 @@ class CLLPerformanceTracking:
         self.lineage_start = time.perf_counter_ns()
 
     def end_lineage(self):
-        if self.lineage_start is None:
+        ls = self.lineage_start  # local variable for attribute access (micro-optimization)
+        if ls is None:
             return
-        self.lineage_elapsed = (time.perf_counter_ns() - self.lineage_start) / 1000000
+        # Use integer division for computing milliseconds: ((ns_delta) // 1_000_000)
+        self.lineage_elapsed = (time.perf_counter_ns() - ls) / 1_000_000
 
     def start_column_lineage(self):
         self.column_lineage_start = time.perf_counter_ns()
