@@ -35,6 +35,7 @@ from recce.util.perf_tracking import LineagePerfTracker
 
 from ...tasks.profile import ProfileTask
 from ...util.breaking import BreakingPerformanceTracking, parse_change_category
+from watchdog.events import FileSystemEventHandler
 
 try:
     import agate
@@ -175,20 +176,21 @@ class EnvironmentEventHandler(FileSystemEventHandler):
         self.observer = observer
         self.watch_files = watch_files
         self.detected_files = set()
+        self._remaining_files = set(watch_files)
         self.callback = callback
 
     def on_created(self, event):
         if event.is_directory:
             return
 
-        if event.src_path in self.watch_files:
-            self.detected_files.add(event.src_path)
-
-        # Check if all target-base files are created
-        if self.detected_files == self.watch_files:
-            if callable(self.callback):
-                self.callback()
-            self.observer.stop()
+        src_path = event.src_path
+        if src_path in self._remaining_files:
+            self._remaining_files.remove(src_path)
+            self.detected_files.add(src_path)
+            if not self._remaining_files:
+                if callable(self.callback):
+                    self.callback()
+                self.observer.stop()
 
 
 def merge_tables(tables: List[agate.Table]) -> agate.Table:
