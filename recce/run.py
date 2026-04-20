@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import time
@@ -17,8 +18,15 @@ from recce.apis.check_func import (
 from recce.apis.run_func import submit_run
 from recce.config import RecceConfig
 from recce.core import default_context
+from recce.models import CheckDAO
 from recce.models.types import RunType
 from recce.summary import generate_markdown_summary
+from recce.tasks.rowcount import (
+    PERMISSION_DENIED_INDICATORS,
+    TABLE_NOT_FOUND_INDICATORS,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def check_github_ci_env(**kwargs):
@@ -91,21 +99,28 @@ def schema_diff_should_be_approved(check_params: dict) -> bool:
         # If the diff is empty, then the check should be approved
         if bool(diff) is False:
             return True
-    except Exception:
-        # If there is any error, then the check should not be approved
-        pass
+    except Exception as e:
+        error_msg = str(e).upper()
+        if any(ind in error_msg for ind in TABLE_NOT_FOUND_INDICATORS + PERMISSION_DENIED_INDICATORS):
+            logger.warning(f"schema_diff approval check skipped (expected): {e}")
+        else:
+            logger.error(f"schema_diff approval check failed (unexpected): {e}", exc_info=True)
 
     return False
 
 
 def run_should_be_approved(run):
     if run.type == RunType.ROW_COUNT_DIFF:
-        # If the run has an error, then the check should not be approved
         if run.error is not None:
             return False
-        # If the row count are exactly the same, then the check should be approved
+        if run.result is None:
+            return False
         for column, row_count_result in run.result.items():
-            if row_count_result["base"] != row_count_result["curr"]:
+            base = row_count_result.get("base")
+            curr = row_count_result.get("curr")
+            if base is None or curr is None:
+                return False
+            if base != curr:
                 return False
         return True
     return False
@@ -301,7 +316,7 @@ def process_failed_checks(failed_checks: List[dict], error_log=None):
     content += markdown_table(failed_check_table).set_params(quote=False, row_sep="markdown").get_markdown()
 
     if error_log:
-        with open(error_log, "w") as f:
+        with open(error_log, "w", encoding="utf-8") as f:
             f.write(content)
         print(f"The failed checks are stored at '{error_log}'")
     else:
@@ -319,6 +334,15 @@ async def cli_run(output_state_file: str, **kwargs):
     from recce.core import load_context
 
     ctx = load_context(**kwargs)
+
+    # Set up the checks if this is a session-based run
+    if kwargs.get("session_id") and kwargs.get("state_loader"):
+        state_loader = kwargs.get("state_loader")
+        try:
+            # Try to populate the checks from the database
+            state_loader.state.checks = CheckDAO().list()
+        except Exception as e:
+            console.print(f"[[red]Error[/red]] Failed to load checks from database: {e}")
 
     is_skip_query = kwargs.get("skip_query", False)
     is_skip_check = kwargs.get("skip_check", False)
@@ -363,14 +387,17 @@ async def cli_run(output_state_file: str, **kwargs):
     console.rule("Export state")
     ctx.state_loader.state_file = output_state_file
     msg = ctx.state_loader.export(ctx.export_state())
-    console.print(msg)
+    if msg is not None:
+        console.print(msg)
+    else:
+        console.print("Export successful")
 
     summary_path = kwargs.get("summary")
     if summary_path:
         dirs = os.path.dirname(summary_path)
         if dirs:
             os.makedirs(dirs, exist_ok=True)
-        with open(summary_path, "w") as f:
+        with open(summary_path, "w", encoding="utf-8") as f:
             f.write(generate_markdown_summary(ctx))
         console.print(f"The summary is stored at '{summary_path}'")
 

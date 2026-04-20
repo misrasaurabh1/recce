@@ -52,15 +52,20 @@ def generate_run_name(run):
         model = params.get("model")
         return f"profile diff of {model}".capitalize()
     elif run_type == RunType.ROW_COUNT_DIFF:
+        # MCP uses node_names (array) or node_ids (array of fully-qualified IDs)
         nodes = params.get("node_names")
         if nodes:
             if len(nodes) == 1:
-                node = nodes[0]
-                return f"row count diff of {node}".capitalize()
+                return f"row count diff of {nodes[0]}".capitalize()
             else:
                 return f"row count of {len(nodes)} nodes".capitalize()
-        else:
-            return "row count of multiple nodes".capitalize()
+        node_ids = params.get("node_ids")
+        if node_ids:
+            if len(node_ids) == 1:
+                return f"row count diff of {node_ids[0].split('.')[-1]}".capitalize()
+            else:
+                return f"row count of {len(node_ids)} nodes".capitalize()
+        return "row count of multiple nodes".capitalize()
     elif run_type == RunType.TOP_K_DIFF:
         model = params.get("model")
         column = params.get("column_name")
@@ -69,12 +74,31 @@ def generate_run_name(run):
         model = params.get("model")
         column = params.get("column_name")
         return f"histogram diff of {model}.{column} ".capitalize()
+    elif run_type == RunType.LINEAGE_DIFF:
+        return "Lineage diff"
+    elif run_type == RunType.SCHEMA_DIFF:
+        # REST API uses node_id (single), MCP uses node_names/node_ids (arrays)
+        node_id = params.get("node_id")
+        if node_id:
+            return f"Schema diff of {node_id.split('.')[-1]}"
+        node_names = params.get("node_names")
+        if node_names and len(node_names) == 1:
+            return f"Schema diff of {node_names[0]}"
+        elif node_names:
+            return f"Schema diff of {len(node_names)} nodes"
+        node_ids = params.get("node_ids")
+        if node_ids and len(node_ids) == 1:
+            return f"Schema diff of {node_ids[0].split('.')[-1]}"
+        elif node_ids:
+            return f"Schema diff of {len(node_ids)} nodes"
+        return "Schema diff"
     else:
         return f"{'run'.capitalize()} - {now}"
 
 
 def create_task(run_type: RunType, params: dict):
-    if default_context().adapter_type == "sqlmesh":
+    context = default_context()
+    if context is not None and context.adapter_type == "sqlmesh":
         from recce.adapter.sqlmesh_adapter import (
             sqlmesh_supported_registry as sqlmesh_registry,
         )
@@ -91,7 +115,7 @@ def create_task(run_type: RunType, params: dict):
     return taskClz(params)
 
 
-def submit_run(type, params, check_id=None):
+def submit_run(type, params, check_id=None, triggered_by=None):
     try:
         run_type = RunType(type)
     except ValueError:
@@ -110,7 +134,7 @@ def submit_run(type, params, check_id=None):
         if dbt_adaptor.adapter is None:
             raise RecceException("Recce Server is not launched under DBT project folder.")
 
-    run = Run(type=run_type, params=params, check_id=check_id, status=RunStatus.RUNNING)
+    run = Run(type=run_type, params=params, check_id=check_id, status=RunStatus.RUNNING, triggered_by=triggered_by)
     run.name = generate_run_name(run)
     RunDAO().create(run)
 
@@ -122,12 +146,16 @@ def submit_run(type, params, check_id=None):
 
     task.progress_listener = progress_listener
 
-    async def update_run_result(run_id, result, error):
+    async def update_run_result(run, result, error, updated_params=None):
+        """Update run with result, error, and optionally updated params."""
         if run is None:
             return
         if result is not None:
             run.result = result
             run.status = RunStatus.FINISHED
+        if updated_params is not None:
+            # Merge updated params (preserves any fields not in updated_params)
+            run.params.update(updated_params)
         if error is not None:
             failed_reason = str(error) if str(error) != "None" else repr(error)
             run.error = failed_reason
@@ -138,10 +166,35 @@ def submit_run(type, params, check_id=None):
     def fn():
         try:
             result = task.execute()
-            asyncio.run_coroutine_threadsafe(update_run_result(run.run_id, result, None), loop)
+
+            # Extract updated params from task after execution
+            updated_params = None
+            if hasattr(task, "params") and task.params is not None:
+                # Serialization logic:
+                # - Most tasks use Pydantic models (v2: model_dump, v1: dict)
+                # - Some tasks may use plain dicts
+                # - If params is an unexpected type, log a warning for debugging
+                # - Handle the case where model_dump() or dict() raises an exception.
+                try:
+                    if hasattr(task.params, "model_dump"):
+                        updated_params = task.params.model_dump()
+                    elif hasattr(task.params, "dict"):
+                        updated_params = task.params.dict()
+                    elif isinstance(task.params, dict):
+                        updated_params = task.params
+                    else:
+                        logger.warning(
+                            f"Could not serialize task.params for run_id={run.run_id}: "
+                            f"unexpected type {type(task.params)} with value {repr(task.params)}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to serialize task.params: {e}")
+                    updated_params = None
+
+            asyncio.run_coroutine_threadsafe(update_run_result(run, result, None, updated_params), loop)
             return result
         except BaseException as e:
-            asyncio.run_coroutine_threadsafe(update_run_result(run.run_id, None, e), loop)
+            asyncio.run_coroutine_threadsafe(update_run_result(run, None, e, None), loop)
             if isinstance(e, RecceException) and e.is_raise is False:
                 return None
             import sentry_sdk

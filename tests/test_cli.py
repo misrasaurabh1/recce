@@ -1,10 +1,16 @@
+import importlib.util
+from pathlib import Path
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
+from recce.cli import mcp_server as cli_command_mcp_server
 from recce.cli import run as cli_command_run
 from recce.cli import server as cli_command_server
+from recce.cli import snapshot as cli_command_snapshot
+from recce.cli import upload_session as cli_command_upload_session
 from recce.core import RecceContext
 from recce.state import CloudStateLoader
 
@@ -24,39 +30,36 @@ class TestCommandServer(TestCase):
         self.runner = CliRunner()
         pass
 
-    @patch.object(RecceContext, "verify_required_artifacts")
-    @patch("recce.cli.uvicorn.run")
-    def test_cmd_server(self, mock_run, mock_verify_required_artifacts):
+    @patch("uvicorn.run")
+    def test_cmd_server(self, mock_run):
         from recce.server import app
 
-        mock_verify_required_artifacts.return_value = True, None
         self.runner.invoke(cli_command_server, ["--host", "unittest", "--port", 5566, "--single-env"])
         mock_run.assert_called_once_with(app, host="unittest", port=5566, lifespan="on")
 
-    @patch("recce.cli.uvicorn.run")
+    @patch("uvicorn.run")
     def test_cmd_server_with_cloud_without_password(self, mock_run):
         # Should fail if no password is provided
         result = self.runner.invoke(cli_command_server, ["--cloud"])
         assert result.exit_code == 1
 
-    @patch("recce.cli.uvicorn.run")
+    @patch.dict("os.environ", {}, clear=False)
+    @patch("uvicorn.run")
     def test_cmd_server_with_cloud_without_token(self, mock_run):
         # Should fail if no token is provided
+        # Clear GITHUB_TOKEN env var to ensure no token is available
+        import os
+
+        os.environ.pop("GITHUB_TOKEN", None)
         result = self.runner.invoke(cli_command_server, ["--cloud", "--password", "unittest"])
         assert result.exit_code == 1
 
-    @patch.object(RecceContext, "verify_required_artifacts")
-    @patch("recce.util.recce_cloud.get_recce_cloud_onboarding_state")
-    @patch("recce.cli.uvicorn.run")
-    @patch("recce.cli.CloudStateLoader")
-    def test_cmd_server_with_cloud(
-        self, mock_state_loader_class, mock_run, mock_get_recce_cloud_onboarding_state, mock_verify_required_artifacts
-    ):
+    @patch("uvicorn.run")
+    @patch("recce.state.CloudStateLoader")
+    def test_cmd_server_with_cloud(self, mock_state_loader_class, mock_run):
         mock_state_loader = MagicMock(spec=CloudStateLoader)
         mock_state_loader.verify.return_value = True
         mock_state_loader.review_mode = True
-        mock_get_recce_cloud_onboarding_state.return_value = "completed"
-        mock_verify_required_artifacts.return_value = True, None
 
         mock_state_loader_class.return_value = mock_state_loader
         self.runner.invoke(
@@ -65,12 +68,74 @@ class TestCommandServer(TestCase):
         mock_state_loader_class.assert_called_once()
         mock_run.assert_called_once()
 
-    @patch.object(RecceContext, "verify_required_artifacts")
+    @patch("uvicorn.run")
+    @patch("recce.state.CloudStateLoader")
+    @patch("recce.util.api_token.prepare_api_token", return_value="test_api_token")
+    def test_cmd_server_with_session_id(
+        self,
+        mock_prepare_api_token,
+        mock_state_loader_class,
+        mock_run,
+    ):
+        """Test that --session-id automatically enables cloud and review mode"""
+        mock_state_loader = MagicMock(spec=CloudStateLoader)
+        mock_state_loader.verify.return_value = True
+        mock_state_loader.review_mode = True
+
+        mock_state_loader_class.return_value = mock_state_loader
+
+        # Test with --session-id (should automatically enable cloud and review)
+        result = self.runner.invoke(cli_command_server, ["--session-id", "test-session-123", "--single-env"])
+
+        # Should succeed
+        assert result.exit_code == 0
+
+        # Should create CloudStateLoader with session_id in cloud_options
+        mock_state_loader_class.assert_called_once()
+        call_args = mock_state_loader_class.call_args
+        assert call_args.kwargs["review_mode"] is True
+        assert "session_id" in call_args.kwargs["cloud_options"]
+        assert call_args.kwargs["cloud_options"]["session_id"] == "test-session-123"
+
+        mock_run.assert_called_once()
+
+    @patch("uvicorn.run")
+    @patch("recce.state.CloudStateLoader")
+    @patch("recce.util.api_token.prepare_api_token", return_value="test_api_token")
+    def test_cmd_server_with_share_url(
+        self,
+        mock_prepare_api_token,
+        mock_state_loader_class,
+        mock_run,
+    ):
+        """Test that --share-url automatically enables cloud and review mode"""
+        mock_state_loader = MagicMock(spec=CloudStateLoader)
+        mock_state_loader.verify.return_value = True
+        mock_state_loader.review_mode = True
+
+        mock_state_loader_class.return_value = mock_state_loader
+
+        # Test with --share-url (should automatically enable cloud and review)
+        result = self.runner.invoke(
+            cli_command_server, ["--share-url", "https://cloud.recce.io/share/abc123", "--single-env"]
+        )
+
+        # Should succeed
+        assert result.exit_code == 0
+
+        # Should create CloudStateLoader with share_id in cloud_options
+        mock_state_loader_class.assert_called_once()
+        call_args = mock_state_loader_class.call_args
+        assert call_args.kwargs["review_mode"] is True
+        assert "share_id" in call_args.kwargs["cloud_options"]
+        assert call_args.kwargs["cloud_options"]["share_id"] == "abc123"
+
+        mock_run.assert_called_once()
+
     @patch("os.path.isdir", side_effect=lambda path: True if path == "existed_folder" else False)
-    @patch("recce.cli.uvicorn.run")
+    @patch("uvicorn.run")
     @patch("recce.server.AppState")
-    def test_cmd_server_with_single_env(self, mock_app_state, mock_run, mock_isdir, mock_verify_required_artifacts):
-        mock_verify_required_artifacts.return_value = True, None
+    def test_cmd_server_with_single_env(self, mock_app_state, mock_run, mock_isdir):
         self.runner.invoke(
             cli_command_server,
             ["--single-env", "--target-path", "existed_folder", "--target-base-path", "non_existed_folder"],
@@ -85,21 +150,14 @@ class TestCommandServer(TestCase):
         assert "show_relaunch_hint" in app_state_flag
         assert app_state_flag["show_relaunch_hint"] is True
 
-        # The target_base_path should be set to the same as target_path
-        verify_required_artifacts_args = mock_verify_required_artifacts.call_args
-        assert (
-            verify_required_artifacts_args.kwargs["target_path"]
-            == verify_required_artifacts_args.kwargs["target_base_path"]
-        )
+        # The target_base_path should be set to target_path via kwargs
+        app_state_kwargs = app_state_call_args.kwargs["kwargs"]
+        assert app_state_kwargs["target_base_path"] == app_state_kwargs.get("target_path")
 
-    @patch.object(RecceContext, "verify_required_artifacts")
     @patch("os.path.isdir", side_effect=lambda path: True if path == "existed_folder" else False)
-    @patch("recce.cli.uvicorn.run")
+    @patch("uvicorn.run")
     @patch("recce.server.AppState")
-    def test_cmd_server_with_single_env_but_review_mode_enabled(
-        self, mock_app_state, mock_run, mock_isdir, mock_verify_required_artifacts
-    ):
-        mock_verify_required_artifacts.return_value = True, None
+    def test_cmd_server_with_single_env_but_review_mode_enabled(self, mock_app_state, mock_run, mock_isdir):
         self.runner.invoke(
             cli_command_server,
             [
@@ -118,6 +176,39 @@ class TestCommandServer(TestCase):
         assert "single_env_onboarding" in app_state_flag
         assert app_state_flag["single_env_onboarding"] is False
 
+    @patch("uvicorn.run")
+    @patch("recce.state.CloudStateLoader")
+    @patch("recce.util.api_token.prepare_api_token", return_value="test_api_token")
+    def test_cmd_server_verify_failure_exits(self, mock_prepare_api_token, mock_state_loader_class, mock_run):
+        """Test that state_loader.verify() failure causes exit(1)."""
+        mock_state_loader = MagicMock(spec=CloudStateLoader)
+        mock_state_loader.verify.return_value = False
+        mock_state_loader.error_and_hint = ("Invalid configuration", "Please check your settings")
+        mock_state_loader_class.return_value = mock_state_loader
+
+        result = self.runner.invoke(cli_command_server, ["--session-id", "test-session", "--single-env"])
+        assert result.exit_code == 1
+        mock_run.assert_not_called()
+
+    @patch("recce.state.CloudStateLoader")
+    def test_create_state_loader_does_not_call_load(self, mock_state_loader_class):
+        """Verify create_state_loader no longer calls state_loader.load()."""
+        from recce.cli import create_state_loader
+
+        mock_state_loader = MagicMock(spec=CloudStateLoader)
+        mock_state_loader_class.return_value = mock_state_loader
+
+        result = create_state_loader(
+            review_mode=True,
+            cloud_mode=True,
+            state_file=None,
+            cloud_options={"session_id": "test"},
+        )
+
+        # create_state_loader should NOT call load() anymore
+        mock_state_loader.load.assert_not_called()
+        assert result is mock_state_loader
+
 
 class TestCommandRun(TestCase):
     def setUp(self):
@@ -125,9 +216,119 @@ class TestCommandRun(TestCase):
         pass
 
     @patch.object(RecceContext, "verify_required_artifacts")
-    @patch("recce.cli.cli_run")
+    @patch("recce.run.cli_run")
     def test_cmd_run(self, mock_cli_run, mock_verify_required_artifacts):
         mock_verify_required_artifacts.return_value = True, None
 
         self.runner.invoke(cli_command_run, [])
         mock_cli_run.assert_called_once()
+
+
+class TestCommandUploadSession(TestCase):
+    def setUp(self):
+        self.runner = CliRunner()
+        pass
+
+    @patch("recce.util.api_token.prepare_api_token", return_value="unittest_token")
+    @patch("recce.artifact.upload_artifacts_to_session", return_value=0)
+    def test_cmd_upload_session(self, mock_upload_artifacts_to_session, mock_prepare_api_token):
+        self.runner.invoke(
+            cli_command_upload_session,
+            ["--session-id", "unittest_session", "--api-token", mock_prepare_api_token.return_value],
+        )
+        mock_upload_artifacts_to_session.assert_called_once_with(
+            "target", session_id="unittest_session", token="unittest_token", debug=False
+        )
+
+        self.runner.invoke(
+            cli_command_snapshot,
+            ["--snapshot-id", "unittest_session", "--api-token", mock_prepare_api_token.return_value],
+        )
+        mock_upload_artifacts_to_session.assert_called_once_with(
+            "target", session_id="unittest_session", token="unittest_token", debug=False
+        )
+
+
+@pytest.mark.skipif(
+    not importlib.util.find_spec("mcp"),
+    reason="mcp package not installed",
+)
+class TestCommandMCPServer(TestCase):
+    """Tests for the mcp-server CLI command's single-env detection logic."""
+
+    def setUp(self):
+        self.runner = CliRunner()
+
+    @patch("asyncio.run")
+    @patch("recce.mcp_server.run_mcp_server", new_callable=MagicMock)
+    @patch("recce.config.RecceConfig")
+    @patch("recce.util.api_token.prepare_api_token", return_value=None)
+    def test_cmd_mcp_server_single_env_when_base_missing(
+        self, mock_prepare_api_token, mock_recce_config, mock_run_mcp_server, mock_asyncio_run
+    ):
+        """When target-base/ directory doesn't exist, single_env mode is activated."""
+        with patch.object(Path, "is_dir", return_value=False):
+            result = self.runner.invoke(
+                cli_command_mcp_server,
+                ["--target-path", "target", "--target-base-path", "target-base"],
+            )
+
+        assert result.exit_code == 0
+
+        # run_mcp_server should receive single_env=True and target_base_path=target_path
+        mock_run_mcp_server.assert_called_once()
+        call_kwargs = mock_run_mcp_server.call_args.kwargs
+        assert call_kwargs["single_env"] is True
+        assert call_kwargs["target_base_path"] == "target"
+
+        # Console should show guidance messages
+        assert "Base artifacts not found" in result.output
+        assert "single-environment mode" in result.output
+        assert "dbt docs generate" in result.output
+
+    @patch("asyncio.run")
+    @patch("recce.mcp_server.run_mcp_server", new_callable=MagicMock)
+    @patch("recce.config.RecceConfig")
+    @patch("recce.util.api_token.prepare_api_token", return_value=None)
+    def test_cmd_mcp_server_no_single_env_when_base_exists(
+        self, mock_prepare_api_token, mock_recce_config, mock_run_mcp_server, mock_asyncio_run
+    ):
+        """When target-base/ directory exists, single_env mode is NOT activated."""
+        with patch.object(Path, "is_dir", return_value=True):
+            result = self.runner.invoke(
+                cli_command_mcp_server,
+                ["--target-path", "target", "--target-base-path", "target-base"],
+            )
+
+        assert result.exit_code == 0
+
+        mock_run_mcp_server.assert_called_once()
+        call_kwargs = mock_run_mcp_server.call_args.kwargs
+        assert call_kwargs.get("single_env", False) is False
+        assert call_kwargs["target_base_path"] == "target-base"
+
+        # No single-env guidance in output
+        assert "Base artifacts not found" not in result.output
+
+
+def test_cli_shows_update_available_warning():
+    """CLI should show update available warning when a newer version exists."""
+    runner = CliRunner()
+    from recce.cli import cli
+
+    with patch("recce.__is_recce_outdated__", True), patch("recce.__latest_version__", "99.0.0"):
+        result = runner.invoke(cli, ["version"])
+        assert result.exit_code == 0
+        assert "Update Available" in result.output
+        assert "99.0.0" in result.output
+
+
+def test_cli_no_update_warning_when_current():
+    """CLI should NOT show update warning when already on latest version."""
+    runner = CliRunner()
+    from recce.cli import cli
+
+    with patch("recce.__is_recce_outdated__", False):
+        result = runner.invoke(cli, ["version"])
+        assert result.exit_code == 0
+        assert "Update Available" not in result.output

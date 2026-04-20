@@ -4,8 +4,8 @@ from unittest.mock import Mock, patch
 from recce.exceptions import RecceException
 from recce.state import CloudStateLoader, RecceState
 from recce.state.const import (
+    RECCE_API_TOKEN_MISSING,
     RECCE_CLOUD_PASSWORD_MISSING,
-    RECCE_CLOUD_TOKEN_MISSING,
 )
 
 
@@ -53,7 +53,7 @@ class TestCloudStateLoader(unittest.TestCase):
         with self.assertRaises(RecceException) as cm:
             CloudStateLoader(cloud_options={})
 
-        self.assertEqual(str(cm.exception), RECCE_CLOUD_TOKEN_MISSING.error_message)
+        self.assertEqual(str(cm.exception), RECCE_API_TOKEN_MISSING.error_message)
 
     @patch("recce.state.state_loader.fetch_pr_metadata")
     def test_verify_github_mode_missing_password(self, mock_fetch_pr):
@@ -80,7 +80,7 @@ class TestCloudStateLoader(unittest.TestCase):
         with self.assertRaises(RecceException) as cm:
             CloudStateLoader(cloud_options={"share_id": "test_share"})
 
-        self.assertEqual(str(cm.exception), RECCE_CLOUD_TOKEN_MISSING.error_message)
+        self.assertEqual(str(cm.exception), RECCE_API_TOKEN_MISSING.error_message)
 
     def test_verify_preview_mode_missing_share_id(self):
         cloud_options = {"api_token": "test_token"}
@@ -91,9 +91,8 @@ class TestCloudStateLoader(unittest.TestCase):
         self.assertFalse(loader.verify())
         self.assertEqual(loader.error_message, "No share ID is provided for the preview catalog.")
 
-    @patch("recce.state.cloud.RecceCloud")
     @patch("requests.get")
-    def test_load_state_from_recce_cloud_github_success(self, mock_get, mock_recce_cloud):
+    def test_load_state_from_github_success(self, mock_get):
         # Setup
         mock_pr_info = Mock()
         mock_pr_info.id = "123"
@@ -104,10 +103,10 @@ class TestCloudStateLoader(unittest.TestCase):
         loader.pr_info = mock_pr_info
         loader.cloud_options = {"password": "test_pass"}
 
-        # Mock RecceCloud
-        mock_cloud_instance = Mock()
-        mock_recce_cloud.return_value = mock_cloud_instance
-        mock_cloud_instance.get_presigned_url_by_github_repo.return_value = "http://presigned.url"
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_presigned_url_by_github_repo.return_value = "http://presigned.url"
+        loader.recce_cloud.get_artifact_metadata.return_value = {"etag": "test_etag"}
 
         # Mock HTTP response
         mock_response = Mock()
@@ -120,24 +119,23 @@ class TestCloudStateLoader(unittest.TestCase):
             mock_state = Mock()
             mock_recce_state.from_file.return_value = mock_state
 
-            result = loader._load_state_from_recce_cloud()
+            result_state, result_etag = loader._load_state_from_github()
 
-            self.assertEqual(result, mock_state)
+            self.assertEqual(result_state, mock_state)
+            self.assertEqual(result_etag, "test_etag")
             mock_get.assert_called_once()
-            mock_cloud_instance.get_presigned_url_by_github_repo.assert_called_once()
+            loader.recce_cloud.get_presigned_url_by_github_repo.assert_called_once()
 
-    @patch("recce.state.cloud.RecceCloud")
     @patch("requests.get")
-    def test_load_state_from_recce_cloud_preview_success(self, mock_get, mock_recce_cloud):
+    def test_load_state_from_preview_success(self, mock_get):
         # Setup
         loader = CloudStateLoader(cloud_options={"api_token": "token", "share_id": "test_share"})
         loader.catalog = "preview"
-        loader.cloud_options = {"share_id": "test_share"}
+        loader.share_id = "test_share"
 
-        # Mock RecceCloud
-        mock_cloud_instance = Mock()
-        mock_recce_cloud.return_value = mock_cloud_instance
-        mock_cloud_instance.get_presigned_url_by_share_id.return_value = "http://presigned.url"
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_presigned_url_by_share_id.return_value = "http://presigned.url"
 
         # Mock HTTP response
         mock_response = Mock()
@@ -150,44 +148,44 @@ class TestCloudStateLoader(unittest.TestCase):
             mock_state = Mock()
             mock_recce_state.from_file.return_value = mock_state
 
-            result = loader._load_state_from_recce_cloud()
+            result_state, result_etag = loader._load_state_from_preview()
 
-            self.assertEqual(result, mock_state)
-            mock_cloud_instance.get_presigned_url_by_share_id.assert_called_once()
+            self.assertEqual(result_state, mock_state)
+            self.assertIsNone(result_etag)  # Preview doesn't use etag
+            loader.recce_cloud.get_presigned_url_by_share_id.assert_called_once()
 
-    @patch("recce.state.cloud.RecceCloud")
     @patch("requests.get")
-    def test_load_state_from_recce_cloud_404_error(self, mock_get, mock_recce_cloud):
+    def test_load_state_from_preview_404_error(self, mock_get):
         # Setup
         loader = CloudStateLoader(cloud_options={"api_token": "token", "share_id": "test_share"})
         loader.catalog = "preview"
+        loader.share_id = "test_share"
 
-        # Mock RecceCloud
-        mock_cloud_instance = Mock()
-        mock_recce_cloud.return_value = mock_cloud_instance
-        mock_cloud_instance.get_presigned_url_by_share_id.return_value = "http://presigned.url"
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_presigned_url_by_share_id.return_value = "http://presigned.url"
 
         # Mock HTTP 404 response
         mock_response = Mock()
         mock_response.status_code = 404
         mock_get.return_value = mock_response
 
-        result = loader._load_state_from_recce_cloud()
+        result_state, result_etag = loader._load_state_from_preview()
 
-        self.assertIsNone(result)
+        self.assertIsNone(result_state)
+        self.assertIsNone(result_etag)
         self.assertEqual(loader.error_message, "The state file is not found in Recce Cloud.")
 
-    @patch("recce.state.cloud.RecceCloud")
     @patch("requests.get")
-    def test_load_state_from_recce_cloud_auth_error(self, mock_get, mock_recce_cloud):
+    def test_load_state_from_preview_auth_error(self, mock_get):
         # Setup
         loader = CloudStateLoader(cloud_options={"api_token": "token", "share_id": "test_share"})
         loader.catalog = "preview"
+        loader.share_id = "test_share"
 
-        # Mock RecceCloud
-        mock_cloud_instance = Mock()
-        mock_recce_cloud.return_value = mock_cloud_instance
-        mock_cloud_instance.get_presigned_url_by_share_id.return_value = "http://presigned.url"
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_presigned_url_by_share_id.return_value = "http://presigned.url"
 
         # Mock HTTP 401 response
         mock_response = Mock()
@@ -196,13 +194,13 @@ class TestCloudStateLoader(unittest.TestCase):
         mock_get.return_value = mock_response
 
         with self.assertRaises(RecceException) as cm:
-            loader._load_state_from_recce_cloud()
+            loader._load_state_from_preview()
 
         self.assertIn("401 Failed to download", str(cm.exception))
 
-    @patch("recce.state.cloud.RecceCloud")
+    @patch("recce.state.cloud.CheckDAO")
     @patch("requests.put")
-    def test_export_state_to_recce_cloud_github_success(self, mock_put, mock_recce_cloud):
+    def test_export_state_to_github_success(self, mock_put, mock_check_dao):
         # Setup
         mock_pr_info = Mock()
         mock_pr_info.id = "123"
@@ -214,59 +212,62 @@ class TestCloudStateLoader(unittest.TestCase):
         loader.cloud_options = {"password": "test_pass"}
         loader.state = RecceState()
 
-        # Mock RecceCloud
-        mock_cloud_instance = Mock()
-        mock_recce_cloud.return_value = mock_cloud_instance
-        mock_cloud_instance.get_presigned_url_by_github_repo.return_value = "http://presigned.url"
+        # Mock CheckDAO
+        mock_check_dao_instance = Mock()
+        mock_check_dao.return_value = mock_check_dao_instance
+        mock_check_dao_instance.status.return_value = {"total": 5, "approved": 3}
+
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_presigned_url_by_github_repo.return_value = "http://presigned.url"
+        loader.recce_cloud.get_artifact_metadata.return_value = {"etag": "test_etag"}
 
         # Mock HTTP response
         mock_response = Mock()
         mock_response.status_code = 200
         mock_put.return_value = mock_response
 
-        result = loader._export_state_to_recce_cloud()
+        result_message, result_etag = loader._export_state_to_github()
 
-        self.assertIsNone(result)  # Success returns None
+        self.assertIsNone(result_message)  # Success returns None
+        self.assertEqual(result_etag, "test_etag")
         mock_put.assert_called_once()
-        mock_cloud_instance.get_presigned_url_by_github_repo.assert_called_once()
+        loader.recce_cloud.get_presigned_url_by_github_repo.assert_called_once()
 
-    @patch("recce.state.cloud.RecceCloud")
     @patch("requests.put")
-    def test_export_state_to_recce_cloud_preview_success(self, mock_put, mock_recce_cloud):
+    def test_export_state_to_preview_success(self, mock_put):
         # Setup
         loader = CloudStateLoader(cloud_options={"api_token": "token", "share_id": "test_share"})
         loader.catalog = "preview"
         loader.cloud_options = {"share_id": "test_share"}
         loader.state = RecceState()
 
-        # Mock RecceCloud
-        mock_cloud_instance = Mock()
-        mock_recce_cloud.return_value = mock_cloud_instance
-        mock_cloud_instance.get_presigned_url_by_share_id.return_value = "http://presigned.url"
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_presigned_url_by_share_id.return_value = "http://presigned.url"
 
         # Mock HTTP response
         mock_response = Mock()
         mock_response.status_code = 200
         mock_put.return_value = mock_response
 
-        result = loader._export_state_to_recce_cloud()
+        result_message, result_etag = loader._export_state_to_preview()
 
-        self.assertIsNone(result)  # Success returns None
-        mock_cloud_instance.get_presigned_url_by_share_id.assert_called_once()
+        self.assertIsNone(result_message)  # Success returns None
+        self.assertIsNone(result_etag)  # Preview doesn't use etag
+        loader.recce_cloud.get_presigned_url_by_share_id.assert_called_once()
 
-    @patch("recce.state.cloud.RecceCloud")
     @patch("requests.put")
-    def test_export_state_to_recce_cloud_failure(self, mock_put, mock_recce_cloud):
+    def test_export_state_to_preview_failure(self, mock_put):
         # Setup
         loader = CloudStateLoader(cloud_options={"api_token": "token", "share_id": "test_share"})
         loader.catalog = "preview"
         loader.cloud_options = {"share_id": "test_share"}
         loader.state = RecceState()
 
-        # Mock RecceCloud
-        mock_cloud_instance = Mock()
-        mock_recce_cloud.return_value = mock_cloud_instance
-        mock_cloud_instance.get_presigned_url_by_share_id.return_value = "http://presigned.url"
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_presigned_url_by_share_id.return_value = "http://presigned.url"
 
         # Mock HTTP error response
         mock_response = Mock()
@@ -274,10 +275,11 @@ class TestCloudStateLoader(unittest.TestCase):
         mock_response.text = "Internal Server Error"
         mock_put.return_value = mock_response
 
-        result = loader._export_state_to_recce_cloud()
+        result_message, result_etag = loader._export_state_to_preview()
 
-        self.assertIn("Failed to upload", result)
-        self.assertIn("Internal Server Error", result)
+        self.assertIn("Failed to upload", result_message)
+        self.assertIn("Internal Server Error", result_message)
+        self.assertIsNone(result_etag)
 
     @patch("recce.state.cloud.RecceCloudStateManager")
     def test_purge_success(self, mock_manager_class):
@@ -309,23 +311,21 @@ class TestCloudStateLoader(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(loader.error_message, "Purge failed")
 
-    @patch("recce.state.cloud.RecceCloud")
-    def test_get_metadata_from_recce_cloud(self, mock_recce_cloud):
+    def test_get_metadata_from_recce_cloud(self):
         # Setup
         mock_pr_info = Mock()
         loader = CloudStateLoader(cloud_options={"api_token": "token"})
         loader.pr_info = mock_pr_info
 
-        # Mock RecceCloud
-        mock_cloud_instance = Mock()
-        mock_recce_cloud.return_value = mock_cloud_instance
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
         mock_metadata = {"etag": "test_etag", "total_checks": 5}
-        mock_cloud_instance.get_artifact_metadata.return_value = mock_metadata
+        loader.recce_cloud.get_artifact_metadata.return_value = mock_metadata
 
         result = loader._get_metadata_from_recce_cloud()
 
         self.assertEqual(result, mock_metadata)
-        mock_cloud_instance.get_artifact_metadata.assert_called_once_with(pr_info=mock_pr_info)
+        loader.recce_cloud.get_artifact_metadata.assert_called_once_with(pr_info=mock_pr_info)
 
     def test_get_metadata_from_recce_cloud_no_pr_info(self):
         loader = CloudStateLoader(cloud_options={"api_token": "token", "share_id": "test"})
@@ -342,36 +342,766 @@ class TestCloudStateLoader(unittest.TestCase):
         loader = CloudStateLoader(cloud_options=cloud_options)
         self.assertIsInstance(loader, RecceStateLoader)
 
-    @patch("recce.state.state_loader.fetch_pr_metadata")
-    def test_load_state_calls_load_state_from_cloud(self, mock_fetch_pr):
+    def test_token_property_github(self):
+        cloud_options = {"api_token": "test_api_token", "share_id": "test_share"}
+        loader = CloudStateLoader(cloud_options=cloud_options)
+        loader.cloud_options = {"github_token": "github_token_value"}
+        self.assertEqual(loader.token, "github_token_value")
+
+    def test_token_property_api(self):
+        cloud_options = {"api_token": "api_token_value", "share_id": "test_share"}
+        loader = CloudStateLoader(cloud_options=cloud_options)
+        self.assertEqual(loader.token, "api_token_value")
+
+    def test_token_property_both_tokens(self):
+        cloud_options = {"api_token": "test_api_token", "share_id": "test_share"}
+        loader = CloudStateLoader(cloud_options=cloud_options)
+        loader.cloud_options = {"github_token": "github_token", "api_token": "api_token"}
+        # Should return github_token first
+        self.assertEqual(loader.token, "github_token")
+
+    def test_init_with_session_id(self):
+        cloud_options = {"api_token": "test_api_token", "session_id": "test_session"}
+        loader = CloudStateLoader(cloud_options=cloud_options)
+
+        self.assertTrue(loader.cloud_mode)
+        self.assertEqual(loader.catalog, "session")
+        self.assertEqual(loader.session_id, "test_session")
+
+    def test_verify_session_mode_success(self):
+        cloud_options = {"api_token": "test_token", "session_id": "test_session"}
+        loader = CloudStateLoader(cloud_options=cloud_options)
+        loader.catalog = "session"
+
+        self.assertTrue(loader.verify())
+
+    def test_verify_session_mode_missing_token(self):
+        # Test that creating CloudStateLoader without api_token raises exception
+        with self.assertRaises(RecceException) as cm:
+            CloudStateLoader(cloud_options={"session_id": "test_session"})
+
+        self.assertEqual(str(cm.exception), RECCE_API_TOKEN_MISSING.error_message)
+
+    def test_verify_session_mode_missing_session_id(self):
+        cloud_options = {"api_token": "test_token"}
+        loader = CloudStateLoader(cloud_options=cloud_options)
+        loader.catalog = "session"
+        loader.cloud_options = cloud_options
+
+        self.assertFalse(loader.verify())
+        self.assertEqual(loader.error_message, "No session ID is provided for the session catalog.")
+
+    @patch("requests.get")
+    def test_load_state_from_session_success_with_existing_state(self, mock_get):
+        # Setup
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+        loader.session_id = "test_session"
+
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+
+        # Mock get_session response
+        mock_session = {"org_id": "org1", "project_id": "proj1"}
+        loader.recce_cloud.get_session.return_value = mock_session
+
+        # Mock get_download_urls_by_session_id response
+        mock_download_urls = {
+            "manifest_url": "http://manifest.url",
+            "catalog_url": "http://catalog.url",
+            "recce_state_url": "http://recce_state.url",
+        }
+        loader.recce_cloud.get_download_urls_by_session_id.return_value = mock_download_urls
+
+        # Mock get_base_session_download_urls response
+        mock_base_urls = {"manifest_url": "http://base_manifest.url", "catalog_url": "http://base_catalog.url"}
+        loader.recce_cloud.get_base_session_download_urls.return_value = mock_base_urls
+
+        # Mock HTTP responses for artifacts
+        mock_response_200 = Mock()
+        mock_response_200.status_code = 200
+        mock_response_200.json.side_effect = [
+            "current_manifest_data",  # current manifest
+            "current_catalog_data",  # current catalog
+            "base_manifest_data",  # base manifest
+            "base_catalog_data",  # base catalog
+        ]
+
+        # Mock HTTP response for recce_state
+        mock_state_response = Mock()
+        mock_state_response.status_code = 200
+        mock_state_response.content = b'{"runs": [{"id": "test"}], "checks": [{"id": "test"}]}'
+
+        # Set up the mock_get to return different responses for different URLs
+        def side_effect(url, **kwargs):
+            if "recce_state" in url:
+                return mock_state_response
+            else:
+                return mock_response_200
+
+        mock_get.side_effect = side_effect
+
+        # Mock RecceState.from_file for the recce_state
+        with patch("recce.state.cloud.RecceState") as mock_recce_state:
+            mock_state = Mock()
+            mock_state.runs = [{"id": "test"}]
+            mock_state.checks = [{"id": "test"}]
+            mock_recce_state.from_file.return_value = mock_state
+
+            result_state = loader._load_state_from_session()
+
+            # Verify the state was loaded from recce_state_url
+            self.assertEqual(result_state, mock_state)
+
+            # Verify artifacts were set
+            self.assertEqual(
+                result_state.artifacts.current, {"manifest": "current_manifest_data", "catalog": "current_catalog_data"}
+            )
+            self.assertEqual(
+                result_state.artifacts.base, {"manifest": "base_manifest_data", "catalog": "base_catalog_data"}
+            )
+
+    @patch("requests.get")
+    def test_load_state_from_session_no_existing_state(self, mock_get):
+        # Setup
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+        loader.session_id = "test_session"
+
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+
+        # Mock get_session response
+        mock_session = {"org_id": "org1", "project_id": "proj1"}
+        loader.recce_cloud.get_session.return_value = mock_session
+
+        # Mock get_download_urls_by_session_id response (no recce_state_url)
+        mock_download_urls = {"manifest_url": "http://manifest.url", "catalog_url": "http://catalog.url"}
+        loader.recce_cloud.get_download_urls_by_session_id.return_value = mock_download_urls
+
+        # Mock get_base_session_download_urls response
+        mock_base_urls = {"manifest_url": "http://base_manifest.url", "catalog_url": "http://base_catalog.url"}
+        loader.recce_cloud.get_base_session_download_urls.return_value = mock_base_urls
+
+        # Mock HTTP responses for artifacts
+        mock_response_200 = Mock()
+        mock_response_200.status_code = 200
+        mock_response_200.json.side_effect = [
+            "current_manifest_data",
+            "current_catalog_data",
+            "base_manifest_data",
+            "base_catalog_data",
+        ]
+        mock_get.return_value = mock_response_200
+
+        # Mock RecceState constructor for empty state
+        with patch("recce.state.cloud.RecceState") as mock_recce_state_class:
+            mock_empty_state = Mock()
+            mock_empty_state.runs = []
+            mock_empty_state.checks = []
+            mock_recce_state_class.return_value = mock_empty_state
+
+            result_state = loader._load_state_from_session()
+
+            # Verify empty state was created
+            self.assertEqual(result_state, mock_empty_state)
+            self.assertEqual(result_state.runs, [])
+            self.assertEqual(result_state.checks, [])
+
+            # Verify artifacts were set
+            self.assertEqual(
+                result_state.artifacts.current, {"manifest": "current_manifest_data", "catalog": "current_catalog_data"}
+            )
+            self.assertEqual(
+                result_state.artifacts.base, {"manifest": "base_manifest_data", "catalog": "base_catalog_data"}
+            )
+
+    def test_load_state_from_session_missing_session_id(self):
+        loader = CloudStateLoader(cloud_options={"api_token": "token"})
+        loader.catalog = "session"
+        loader.session_id = None
+
+        with self.assertRaises(RecceException) as cm:
+            loader._load_state_from_session()
+
+        self.assertEqual(
+            str(cm.exception), "Cannot load the session state from Recce Cloud. No session ID is provided."
+        )
+
+    def test_load_state_from_session_invalid_org_project(self):
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+        loader.session_id = "test_session"
+
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+
+        # Mock get_session response with missing org_id
+        mock_session = {"project_id": "proj1"}  # Missing org_id
+        loader.recce_cloud.get_session.return_value = mock_session
+
+        with self.assertRaises(RecceException) as cm:
+            loader._load_state_from_session()
+
+        self.assertEqual(str(cm.exception), "Session test_session does not belong to a valid organization or project.")
+
+    @patch("requests.put")
+    def test_export_state_to_session_success(self, mock_put):
+        # Setup
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+        loader.session_id = "test_session"
+
+        # Create a mock state with runs and checks
+        mock_runs = Mock()
+        mock_runs.copy.return_value = [{"id": "run1"}, {"id": "run2"}]
+        mock_checks = Mock()
+        mock_checks.copy.return_value = [{"id": "check1"}]
+
+        mock_state = Mock()
+        mock_state.runs = mock_runs
+        mock_state.checks = mock_checks
+        loader.state = mock_state
+
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+
+        # Mock get_session response
+        mock_session = {"org_id": "org1", "project_id": "proj1"}
+        loader.recce_cloud.get_session.return_value = mock_session
+
+        # Mock get_upload_urls_by_session_id response
+        mock_upload_urls = {"recce_state_url": "http://upload_recce_state.url"}
+        loader.recce_cloud.get_upload_urls_by_session_id.return_value = mock_upload_urls
+
+        # Mock HTTP response
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_put.return_value = mock_response
+
+        # Mock RecceState constructor for upload state
+        with patch("recce.state.cloud.RecceState") as mock_recce_state_class:
+            mock_upload_state = Mock()
+            mock_upload_state.to_json.return_value = '{"runs": [], "checks": []}'
+            mock_recce_state_class.return_value = mock_upload_state
+
+            result_message, result_etag = loader._export_state_to_session()
+
+            # Verify success
+            self.assertIsNone(result_message)
+            self.assertIsNone(result_etag)
+
+            # Verify RecceState was created with empty artifacts
+            mock_recce_state_class.assert_called_once()
+
+            # Verify runs and checks were copied
+            self.assertEqual(mock_upload_state.runs, [{"id": "run1"}, {"id": "run2"}])
+            self.assertEqual(mock_upload_state.checks, [{"id": "check1"}])
+
+    def test_export_state_to_session_missing_session_id(self):
+        loader = CloudStateLoader(cloud_options={"api_token": "token"})
+        loader.catalog = "session"
+        loader.session_id = None
+
+        with self.assertRaises(RecceException) as cm:
+            loader._export_state_to_session()
+
+        self.assertEqual(str(cm.exception), "Cannot export state to session. No session ID is provided.")
+
+    def test_export_state_to_session_no_recce_state_url(self):
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+        loader.session_id = "test_session"
+        loader.state = Mock()
+
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+
+        # Mock get_session response
+        mock_session = {"org_id": "org1", "project_id": "proj1"}
+        loader.recce_cloud.get_session.return_value = mock_session
+
+        # Mock get_upload_urls_by_session_id response without recce_state_url
+        mock_upload_urls = {}
+        loader.recce_cloud.get_upload_urls_by_session_id.return_value = mock_upload_urls
+
+        with self.assertRaises(RecceException) as cm:
+            loader._export_state_to_session()
+
+        self.assertEqual(str(cm.exception), "No recce_state_url found for session test_session")
+
+    @patch("requests.put")
+    def test_export_state_to_session_upload_failure(self, mock_put):
+        # Setup
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+        loader.session_id = "test_session"
+
+        mock_runs = Mock()
+        mock_runs.copy.return_value = []
+        mock_checks = Mock()
+        mock_checks.copy.return_value = []
+
+        mock_state = Mock()
+        mock_state.runs = mock_runs
+        mock_state.checks = mock_checks
+        loader.state = mock_state
+
+        # Mock loader's RecceCloud instance
+        loader.recce_cloud = Mock()
+
+        # Mock get_session response
+        mock_session = {"org_id": "org1", "project_id": "proj1"}
+        loader.recce_cloud.get_session.return_value = mock_session
+
+        # Mock get_upload_urls_by_session_id response
+        mock_upload_urls = {"recce_state_url": "http://upload_recce_state.url"}
+        loader.recce_cloud.get_upload_urls_by_session_id.return_value = mock_upload_urls
+
+        # Mock HTTP error response
+        mock_response = Mock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+        mock_put.return_value = mock_response
+
+        # Mock RecceState constructor for upload state
+        with patch("recce.state.cloud.RecceState") as mock_recce_state_class:
+            mock_upload_state = Mock()
+            mock_upload_state.to_json.return_value = '{"runs": [], "checks": []}'
+            mock_recce_state_class.return_value = mock_upload_state
+
+            result_message, result_etag = loader._export_state_to_session()
+
+            # Verify failure
+            self.assertIn("Failed to upload", result_message)
+            self.assertIn("Internal Server Error", result_message)
+            self.assertIsNone(result_etag)
+
+    @patch.object(CloudStateLoader, "_download_session_recce_state")
+    @patch.object(CloudStateLoader, "_download_base_session_artifacts")
+    @patch.object(CloudStateLoader, "_download_session_artifacts")
+    def test_load_state_from_session_passes_session_id_to_base_download(
+        self,
+        mock_download_session_artifacts,
+        mock_download_base_session_artifacts,
+        mock_download_session_state,
+    ):
+        """Verify _load_state_from_session passes session_id to _download_base_session_artifacts."""
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+        loader.session_id = "test_session"
+
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_session.return_value = {
+            "org_id": "org1",
+            "project_id": "proj1",
+        }
+
+        mock_download_session_artifacts.return_value = {"manifest": "current_manifest", "catalog": "current_catalog"}
+        mock_download_base_session_artifacts.return_value = {"manifest": "base_manifest", "catalog": "base_catalog"}
+        mock_download_session_state.return_value = RecceState()
+
+        loader._load_state_from_session()
+
+        # Verify session_id was passed to _download_base_session_artifacts
+        mock_download_base_session_artifacts.assert_called_once_with(
+            loader.recce_cloud, "org1", "proj1", session_id="test_session"
+        )
+
+    @patch("requests.get")
+    def test_download_base_session_artifacts_passes_session_id(self, mock_get):
+        """Verify _download_base_session_artifacts passes session_id to get_base_session_download_urls."""
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+
+        mock_cloud = Mock()
+        mock_cloud.get_base_session_download_urls.return_value = {
+            "manifest_url": "http://base_manifest.url",
+            "catalog_url": "http://base_catalog.url",
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.side_effect = ["base_manifest_data", "base_catalog_data"]
+        mock_get.return_value = mock_response
+
+        loader._download_base_session_artifacts(mock_cloud, "org1", "proj1", session_id="test_session")
+
+        mock_cloud.get_base_session_download_urls.assert_called_once_with("org1", "proj1", session_id="test_session")
+
+    @patch("requests.get")
+    def test_download_base_session_artifacts_without_session_id(self, mock_get):
+        """Verify _download_base_session_artifacts works without session_id (backward compat)."""
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+
+        mock_cloud = Mock()
+        mock_cloud.get_base_session_download_urls.return_value = {
+            "manifest_url": "http://base_manifest.url",
+            "catalog_url": "http://base_catalog.url",
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.side_effect = ["base_manifest_data", "base_catalog_data"]
+        mock_get.return_value = mock_response
+
+        loader._download_base_session_artifacts(mock_cloud, "org1", "proj1")
+
+        mock_cloud.get_base_session_download_urls.assert_called_once_with("org1", "proj1", session_id=None)
+
+    @patch.object(CloudStateLoader, "_download_session_recce_state")
+    @patch.object(CloudStateLoader, "_download_base_session_artifacts")
+    @patch.object(CloudStateLoader, "_download_session_artifacts")
+    def test_load_state_from_session_sets_pull_request_from_pr_link(
+        self,
+        mock_download_session_artifacts,
+        mock_download_base_session_artifacts,
+        mock_download_session_state,
+    ):
+        loader = CloudStateLoader(cloud_options={"api_token": "token", "session_id": "test_session"})
+        loader.catalog = "session"
+        loader.session_id = "test_session"
+
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_session.return_value = {
+            "org_id": "org1",
+            "project_id": "proj1",
+            "pr_link": "https://github.com/org/repo/pull/99",
+        }
+
+        mock_download_session_artifacts.return_value = {"manifest": "current_manifest", "catalog": "current_catalog"}
+        mock_download_base_session_artifacts.return_value = {"manifest": "base_manifest", "catalog": "base_catalog"}
+
+        state = RecceState()
+        mock_download_session_state.return_value = state
+
+        result_state = loader._load_state_from_session()
+
+        mock_download_session_artifacts.assert_called_once()
+        mock_download_base_session_artifacts.assert_called_once()
+        mock_download_session_state.assert_called_once()
+        self.assertIs(result_state, state)
+        self.assertIsNotNone(loader.pr_info)
+        self.assertEqual(str(loader.pr_info.id), "99")
+        self.assertEqual(loader.pr_info.url, "https://github.com/org/repo/pull/99")
+        self.assertIs(result_state.pull_request, loader.pr_info)
+
+
+class TestS3HeaderHelpers(unittest.TestCase):
+
+    def test_normalize_s3_metadata_basic(self):
+        from recce.state.cloud import normalize_s3_metadata
+
+        result = normalize_s3_metadata({"commit": "abc123", "dbt_version": "1.8.9"})
+        self.assertEqual(result, {"commit": "abc123", "dbt_version": "1.8.9"})
+
+    def test_normalize_s3_metadata_none_values(self):
+        from recce.state.cloud import normalize_s3_metadata
+
+        result = normalize_s3_metadata({"commit": None, "dbt_version": "1.8.9"})
+        self.assertEqual(result, {"commit": "", "dbt_version": "1.8.9"})
+
+    def test_normalize_s3_metadata_int_values(self):
+        from recce.state.cloud import normalize_s3_metadata
+
+        result = normalize_s3_metadata({"total_checks": 5, "approved_checks": 3})
+        self.assertEqual(result, {"total_checks": "5", "approved_checks": "3"})
+
+    def test_normalize_s3_metadata_empty(self):
+        from recce.state.cloud import normalize_s3_metadata
+
+        self.assertEqual(normalize_s3_metadata({}), {})
+
+    def test_s3_metadata_headers_basic(self):
+        from recce.state.cloud import s3_metadata_headers
+
+        result = s3_metadata_headers({"commit": "abc123", "dbt_version": "1.8.9"})
+        self.assertEqual(
+            result,
+            {
+                "x-amz-meta-commit": "abc123",
+                "x-amz-meta-dbt_version": "1.8.9",
+            },
+        )
+
+    def test_s3_metadata_headers_none_values(self):
+        from recce.state.cloud import s3_metadata_headers
+
+        result = s3_metadata_headers({"commit": None, "dbt_version": "1.8.9"})
+        self.assertEqual(
+            result,
+            {
+                "x-amz-meta-commit": "",
+                "x-amz-meta-dbt_version": "1.8.9",
+            },
+        )
+
+    def test_s3_metadata_headers_empty(self):
+        from recce.state.cloud import s3_metadata_headers
+
+        self.assertEqual(s3_metadata_headers({}), {})
+
+
+class TestUploadIncludesMetaHeaders(unittest.TestCase):
+
+    @patch("recce.state.cloud.CheckDAO")
+    @patch("requests.put")
+    def test_export_state_to_github_sends_meta_headers(self, mock_put, mock_check_dao):
+        """Verify _upload_state_to_url includes x-amz-meta-* headers when metadata is provided."""
         mock_pr_info = Mock()
         mock_pr_info.id = "123"
-        mock_fetch_pr.return_value = mock_pr_info
+        mock_pr_info.repository = "owner/repo"
 
-        loader = CloudStateLoader(cloud_options={"github_token": "token", "password": "pass"})
-
-        with patch.object(loader, "_load_state_from_cloud") as mock_load:
-            mock_load.return_value = (RecceState(), "etag")
-            result = loader._load_state()
-
-            mock_load.assert_called_once()
-            self.assertIsInstance(result[0], RecceState)
-
-    @patch("recce.state.state_loader.fetch_pr_metadata")
-    def test_export_state_calls_export_state_to_cloud(self, mock_fetch_pr):
-        mock_pr_info = Mock()
-        mock_pr_info.id = "123"
-        mock_fetch_pr.return_value = mock_pr_info
-
-        loader = CloudStateLoader(cloud_options={"github_token": "token", "password": "pass"})
+        loader = CloudStateLoader(cloud_options={"api_token": "token"})
+        loader.catalog = "github"
+        loader.pr_info = mock_pr_info
+        loader.cloud_options = {"password": "test_pass"}
         loader.state = RecceState()
 
-        with patch.object(loader, "_export_state_to_cloud") as mock_export:
-            mock_export.return_value = ("message", "etag")
-            result = loader._export_state()
+        mock_check_dao.return_value.status.return_value = {"total": 5, "approved": 3}
 
-            mock_export.assert_called_once()
-            self.assertEqual(result, ("message", "etag"))
+        loader.recce_cloud = Mock()
+        loader.recce_cloud.get_presigned_url_by_github_repo.return_value = "http://presigned.url"
+        loader.recce_cloud.get_artifact_metadata.return_value = {"etag": "test_etag"}
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_put.return_value = mock_response
+
+        loader._export_state_to_github()
+
+        # Verify x-amz-meta-* headers were included in the PUT request
+        call_kwargs = mock_put.call_args
+        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
+        self.assertEqual(headers["x-amz-meta-total_checks"], "5")
+        self.assertEqual(headers["x-amz-meta-approved_checks"], "3")
+        self.assertIn("x-amz-tagging", headers)
+
+
+class TestGetSignedHeaders(unittest.TestCase):
+
+    def test_extracts_signed_headers_from_presigned_url(self):
+        from recce.state.cloud import get_signed_headers
+
+        url = (
+            "https://s3.amazonaws.com/bucket/key"
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-SignedHeaders=host%3Bx-amz-meta-commit%3Bx-amz-meta-dbt_version%3Bx-amz-tagging"
+        )
+        result = get_signed_headers(url)
+        self.assertEqual(result, {"host", "x-amz-meta-commit", "x-amz-meta-dbt_version", "x-amz-tagging"})
+
+    def test_returns_empty_set_when_no_signed_headers_param(self):
+        from recce.state.cloud import get_signed_headers
+
+        url = "https://s3.amazonaws.com/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        result = get_signed_headers(url)
+        self.assertEqual(result, set())
+
+    def test_case_insensitive_param_name(self):
+        from recce.state.cloud import get_signed_headers
+
+        url = "https://s3.amazonaws.com/bucket/key?x-amz-signedheaders=host%3Bx-amz-tagging"
+        result = get_signed_headers(url)
+        self.assertEqual(result, {"host", "x-amz-tagging"})
+
+
+class TestFilterHeadersForPresignedUrl(unittest.TestCase):
+
+    def test_filters_out_unsigned_headers(self):
+        from recce.state.cloud import filter_headers_for_presigned_url
+
+        url = (
+            "https://s3.amazonaws.com/bucket/key"
+            "?X-Amz-SignedHeaders=host%3Bx-amz-server-side-encryption-customer-algorithm"
+            "%3Bx-amz-server-side-encryption-customer-key"
+            "%3Bx-amz-server-side-encryption-customer-key-md5"
+        )
+        headers = {
+            "x-amz-server-side-encryption-customer-algorithm": "AES256",
+            "x-amz-server-side-encryption-customer-key": "abc",
+            "x-amz-server-side-encryption-customer-key-MD5": "def",
+            "x-amz-tagging": "commit=abc&dbt_version=1.0",
+            "x-amz-meta-commit": "abc",
+            "x-amz-meta-dbt_version": "1.0",
+        }
+        result = filter_headers_for_presigned_url(url, headers)
+        self.assertIn("x-amz-server-side-encryption-customer-algorithm", result)
+        self.assertIn("x-amz-server-side-encryption-customer-key", result)
+        self.assertIn("x-amz-server-side-encryption-customer-key-MD5", result)
+        self.assertNotIn("x-amz-tagging", result)
+        self.assertNotIn("x-amz-meta-commit", result)
+        self.assertNotIn("x-amz-meta-dbt_version", result)
+
+    def test_keeps_all_headers_when_all_are_signed(self):
+        from recce.state.cloud import filter_headers_for_presigned_url
+
+        url = "https://s3.amazonaws.com/bucket/key" "?X-Amz-SignedHeaders=host%3Bx-amz-tagging%3Bx-amz-meta-commit"
+        headers = {
+            "x-amz-tagging": "commit=abc",
+            "x-amz-meta-commit": "abc",
+        }
+        result = filter_headers_for_presigned_url(url, headers)
+        self.assertEqual(result, headers)
+
+    def test_fallback_when_no_signed_headers_param(self):
+        from recce.state.cloud import filter_headers_for_presigned_url
+
+        url = "https://s3.amazonaws.com/bucket/key"
+        headers = {
+            "x-amz-tagging": "commit=abc",
+            "x-amz-meta-commit": "abc",
+        }
+        result = filter_headers_for_presigned_url(url, headers)
+        self.assertEqual(result, headers)
+
+    def test_ssec_headers_always_preserved_even_when_unsigned(self):
+        """SSE-C headers must never be partially filtered — that causes
+        'InvalidArgument: must provide an appropriate secret key'."""
+        from recce.state.cloud import filter_headers_for_presigned_url
+
+        # Presigned URL only signs 'host' — no SSE-C and no metadata headers signed.
+        url = "https://s3.amazonaws.com/bucket/key?X-Amz-SignedHeaders=host"
+        headers = {
+            "x-amz-server-side-encryption-customer-algorithm": "AES256",
+            "x-amz-server-side-encryption-customer-key": "abc",
+            "x-amz-server-side-encryption-customer-key-MD5": "def",
+            "x-amz-tagging": "commit=abc&dbt_version=1.0",
+            "x-amz-meta-commit": "abc",
+            "x-amz-meta-dbt_version": "1.0",
+        }
+        result = filter_headers_for_presigned_url(url, headers)
+        # SSE-C headers kept
+        self.assertIn("x-amz-server-side-encryption-customer-algorithm", result)
+        self.assertIn("x-amz-server-side-encryption-customer-key", result)
+        self.assertIn("x-amz-server-side-encryption-customer-key-MD5", result)
+        # Metadata headers stripped
+        self.assertNotIn("x-amz-tagging", result)
+        self.assertNotIn("x-amz-meta-commit", result)
+        self.assertNotIn("x-amz-meta-dbt_version", result)
+
+    def test_only_metadata_headers_filtered_not_arbitrary_headers(self):
+        """Non-metadata, non-SSE-C headers should also be preserved."""
+        from recce.state.cloud import filter_headers_for_presigned_url
+
+        url = "https://s3.amazonaws.com/bucket/key?X-Amz-SignedHeaders=host%3Bcontent-type"
+        headers = {
+            "Content-Type": "application/gzip",
+            "x-amz-tagging": "commit=abc",
+            "x-amz-meta-commit": "abc",
+        }
+        result = filter_headers_for_presigned_url(url, headers)
+        self.assertIn("Content-Type", result)
+        self.assertNotIn("x-amz-tagging", result)
+        self.assertNotIn("x-amz-meta-commit", result)
+
+
+class TestRecceCloudStateManagerUploadFiltersHeaders(unittest.TestCase):
+    """Verify _upload_state_to_recce_cloud applies filter_headers_for_presigned_url."""
+
+    @patch("recce.state.cloud.fetch_pr_metadata")
+    @patch("recce.state.cloud.RecceCloud")
+    @patch("requests.put")
+    def test_upload_drops_unsigned_metadata_headers(self, mock_put, mock_cloud_cls, mock_fetch_pr):
+        from recce.state.cloud import RecceCloudStateManager
+
+        mock_pr_info = Mock()
+        mock_pr_info.id = "42"
+        mock_pr_info.repository = "owner/repo"
+        mock_fetch_pr.return_value = mock_pr_info
+
+        # Presigned URL that only signs host + SSE-C headers (no metadata)
+        signed = (
+            "https://s3.amazonaws.com/bucket/key"
+            "?X-Amz-SignedHeaders=host"
+            "%3Bx-amz-server-side-encryption-customer-algorithm"
+            "%3Bx-amz-server-side-encryption-customer-key"
+            "%3Bx-amz-server-side-encryption-customer-key-md5"
+        )
+        mock_cloud_cls.return_value.get_presigned_url_by_github_repo.return_value = signed
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_put.return_value = mock_response
+
+        mgr = RecceCloudStateManager(cloud_options={"github_token": "ghp_test", "password": "pw"})
+        state = RecceState()
+        metadata = {"total_checks": "5", "approved_checks": "3"}
+        mgr._upload_state_to_recce_cloud(state, metadata)
+
+        call_kwargs = mock_put.call_args
+        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
+        # SSE-C headers present
+        self.assertIn("x-amz-server-side-encryption-customer-algorithm", headers)
+        # Metadata headers filtered out (not signed)
+        self.assertNotIn("x-amz-tagging", headers)
+        self.assertNotIn("x-amz-meta-total_checks", headers)
+
+
+class TestUploadDbtArtifactsFiltersHeaders(unittest.TestCase):
+    """Verify upload_dbt_artifacts applies filter_headers_for_presigned_url."""
+
+    @patch("recce.artifact.requests.put")
+    @patch("recce.artifact.RecceCloud")
+    @patch("recce.artifact.commit_hash_from_branch", return_value="abc123")
+    @patch("recce.artifact.hosting_repo", return_value="owner/repo")
+    @patch("recce.artifact.current_branch", return_value="test-branch")
+    @patch("recce.artifact.archive_artifacts")
+    def test_upload_drops_unsigned_metadata_headers(
+        self, mock_archive, mock_branch, mock_repo, mock_sha, mock_cloud_cls, mock_put
+    ):
+        import json
+        import os
+        import tempfile
+
+        from recce.artifact import upload_dbt_artifacts
+
+        # Create a valid artifacts directory
+        tmp_dir = tempfile.mkdtemp()
+        manifest_path = os.path.join(tmp_dir, "manifest.json")
+        catalog_path = os.path.join(tmp_dir, "catalog.json")
+        with open(manifest_path, "w") as f:
+            json.dump({"metadata": {"dbt_version": "1.5.0"}}, f)
+        with open(catalog_path, "w") as f:
+            json.dump({}, f)
+
+        # archive_artifacts returns a temp file in a SEPARATE dir (matches real behavior)
+        gz_dir = tempfile.mkdtemp()
+        gz_path = os.path.join(gz_dir, "dbt_artifacts.tar.gz")
+        with open(gz_path, "wb") as f:
+            f.write(b"fake")
+        mock_archive.return_value = (gz_path, "1.5.0")
+
+        # Presigned URL that only signs host + SSE-C (no metadata)
+        signed = (
+            "https://s3.amazonaws.com/bucket/key"
+            "?X-Amz-SignedHeaders=host"
+            "%3Bx-amz-server-side-encryption-customer-algorithm"
+            "%3Bx-amz-server-side-encryption-customer-key"
+            "%3Bx-amz-server-side-encryption-customer-key-md5"
+        )
+        mock_cloud_cls.return_value.get_presigned_url_by_github_repo.return_value = signed
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_put.return_value = mock_response
+
+        try:
+            upload_dbt_artifacts(tmp_dir, "test-branch", "ghp_tok", "password")
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        call_kwargs = mock_put.call_args
+        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
+        # SSE-C headers present
+        self.assertIn("x-amz-server-side-encryption-customer-algorithm", headers)
+        # Metadata headers filtered out
+        self.assertNotIn("x-amz-tagging", headers)
+        self.assertNotIn("x-amz-meta-commit", headers)
+        self.assertNotIn("x-amz-meta-dbt_version", headers)
 
 
 if __name__ == "__main__":

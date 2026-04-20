@@ -7,15 +7,78 @@ on:
     paths-ignore:
       - "js/**"
       - "recce/data/**"
-  pull_request_target:
+  pull_request:
     branches:
       - main
     paths-ignore:
       - "js/**"
       - "recce/data/**"
+  schedule:
+    - cron: "0 19 * * 0,1,2,3,4" # run at 3 AM (UTC + 8) every working day, after nightly build
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Cloud environment to test against"
+        type: choice
+        required: true
+        options:
+          - production
+          - staging
+        default: production
+
+# Explicitly limit permissions
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
+  resolve-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+    steps:
+      - name: Resolve target environment
+        id: resolve
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Check if the PR author has write permission
+  # This job runs in the privileged context but doesn't checkout untrusted code
+  authorize:
+    needs: resolve-environment
+    if: needs.resolve-environment.outputs.environment == 'production' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+    steps:
+      - name: Check if PR author has write permission
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.triggering_actor }}/permission --jq '.permission' 2>/dev/null || echo "none")
+          if [[ "$PERMISSION" == "write" || "$PERMISSION" == "admin" ]]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            echo "::warning::Cloud smoke test skipped for forked repository. This test will be migrated to a separate workflow for external contributors."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Production cloud smoke test
   smoke-test-cloud:
+    needs: [resolve-environment, authorize]
+    if: needs.resolve-environment.outputs.environment == 'production' && needs.authorize.outputs.authorized == 'true'
     concurrency:
       group: smoke-test-cloud
       cancel-in-progress: false
@@ -29,43 +92,100 @@ jobs:
           - python-version: "3.13"
             dbt-version: "latest"
     steps:
-      - name: Check external code before checkout
+      # Safe checkout: only proceeds after authorization check passes
+      # codeql[js/actions/pull-request-target] - Authorization verified in previous job
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install Recce and dbt
         run: |
-          PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.triggering_actor }}/permission --jq '.permission')
-          if [[ "$PERMISSION" != "write" && "$PERMISSION" != "admin" ]]; then
-            echo "Please review the code from ${{ github.actor }}, then re-run the workflow."
-            exit 1
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: actions/checkout@v3
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: "pip" # caching pip dependencies
-          cache-dependency-path: setup.py
-      - run: |
-          python -m pip install --upgrade pip
+          uv venv
+          uv sync --no-dev --python ${{ matrix.python-version }}
           if [ "${{ matrix.dbt-version }}" == "latest" ]; then
-            pip install dbt-core
-            pip install dbt-duckdb
+            uv pip install dbt-core dbt-duckdb
           else
-            pip install dbt-core~=${{ matrix.dbt-version }}.0
-            pip install dbt-duckdb~=${{ matrix.dbt-version }}.0
+            uv pip install dbt-core~=${{ matrix.dbt-version }}.0 dbt-duckdb~=${{ matrix.dbt-version }}.0
           fi
-
-      - name: Install Recce
-        run: |
-          pip install .
 
       - name: Run smoke test - dbt
         run: |
+          source .venv/bin/activate
           ./integration_tests/dbt/smoke_test_cloud.sh
         env:
-          GITHUB_TOKEN: ${{ secrets.RECCE_CLOUD_TOKEN }}
-          RECCE_STATE_PASSWORD: ${{ vars.RECCE_STATE_PASSWORD}}
+          GITHUB_TOKEN: ${{ secrets.DEV_INFUSEAI_GITHUB_TOKEN }}
+          RECCE_STATE_PASSWORD: ${{ vars.RECCE_STATE_PASSWORD }}
+
+  # Staging cloud smoke test - runs daily after nightly build
+  smoke-test-cloud-staging:
+    needs: resolve-environment
+    if: needs.resolve-environment.outputs.environment == 'staging'
+    concurrency:
+      group: smoke-test-cloud-staging
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - python-version: "3.11"
+            dbt-version: "1.8"
+          - python-version: "3.13"
+            dbt-version: "latest"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install Recce and dbt
+        run: |
+          uv venv
+          uv sync --no-dev --python ${{ matrix.python-version }}
+          if [ "${{ matrix.dbt-version }}" == "latest" ]; then
+            uv pip install dbt-core dbt-duckdb
+          else
+            uv pip install dbt-core~=${{ matrix.dbt-version }}.0 dbt-duckdb~=${{ matrix.dbt-version }}.0
+          fi
+
+      - name: Run smoke test - dbt (staging)
+        run: |
+          source .venv/bin/activate
+          ./integration_tests/dbt/smoke_test_cloud.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEV_INFUSEAI_GITHUB_TOKEN }}
+          RECCE_STATE_PASSWORD: ${{ vars.RECCE_STATE_PASSWORD }}
+          RECCE_CLOUD_API_HOST: ${{ vars.RECCE_CLOUD_API_HOST_STAGING }}
+
+  notify-staging-failure:
+    needs: smoke-test-cloud-staging
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        run: |
+          curl -s -X POST "$SLACK_WEBHOOK_URL_DEV" \
+            -H 'Content-type: application/json' \
+            -d "{
+              \"text\": \":red_circle: Staging cloud smoke test failed\",
+              \"blocks\": [
+                {
+                  \"type\": \"section\",
+                  \"text\": {
+                    \"type\": \"mrkdwn\",
+                    \"text\": \":red_circle: *Staging Cloud Smoke Test Failed*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View workflow run>\"
+                  }
+                }
+              ]
+            }"
+        env:
+          SLACK_WEBHOOK_URL_DEV: ${{ secrets.SLACK_WEBHOOK_URL_DEV }}

@@ -15,7 +15,6 @@ from recce.state import (
     RecceStateLoader,
     RecceStateMetadata,
 )
-from recce.util.recce_cloud import set_recce_cloud_onboarding_state
 
 logger = logging.getLogger("uvicorn")
 
@@ -126,7 +125,7 @@ class RecceContext:
             state.git = self.state_loader.state.git
             state.pull_request = self.state_loader.state.pull_request
         else:
-            git = GitRepoInfo.from_current_repositroy()
+            git = GitRepoInfo.from_current_repository()
             if git:
                 state.git = git
             if self.state_loader.pr_info:
@@ -145,7 +144,7 @@ class RecceContext:
         state.runs = self.runs
         state.checks = self.checks
         state.artifacts = self.adapter.export_artifacts()
-        git = GitRepoInfo.from_current_repositroy()
+        git = GitRepoInfo.from_current_repository()
         if git:
             state.git = git
         pr = PullRequestInfo(url=os.getenv("RECCE_PR_URL"))
@@ -264,17 +263,6 @@ class RecceContext:
             import_checks = len(self.checks)
 
         return import_checks
-
-    def mark_onboarding_completed(self):
-        if self.state_loader.cloud_mode:
-            try:
-                token = self.state_loader.cloud_options.get("github_token")
-                set_recce_cloud_onboarding_state(token, "completed")
-            except Exception as e:
-                logger.debug(f"Failed to mark onboarding completed in Recce Cloud. Reason: {str(e)}")
-        else:
-            # Skip the onboarding state for non-cloud mode
-            pass
 
     @staticmethod
     def verify_required_artifacts(**kwargs) -> Tuple[bool, Optional[str]]:

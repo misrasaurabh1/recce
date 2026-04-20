@@ -1,7 +1,8 @@
 import json
 import logging
 import os
-from typing import IO, Dict
+import typing
+from typing import IO, Dict, Optional
 
 import requests
 
@@ -9,8 +10,12 @@ from recce import get_version
 from recce.event import get_user_id, is_anonymous_tracking
 from recce.pull_request import PullRequestInfo
 
-RECCE_CLOUD_API_HOST = os.environ.get("RECCE_CLOUD_API_HOST", "https://cloud.datarecce.io")
-RECCE_CLOUD_BASE_URL = os.environ.get("RECCE_CLOUD_BASE_URL", RECCE_CLOUD_API_HOST)
+if typing.TYPE_CHECKING:
+    from recce.util.cloud import ChecksCloud
+
+RECCE_CLOUD_DEFAULT_HOST = "https://cloud.reccehq.com"
+RECCE_CLOUD_API_HOST = os.environ.get("RECCE_CLOUD_API_HOST", RECCE_CLOUD_DEFAULT_HOST)
+RECCE_CLOUD_BASE_URL = os.environ.get("RECCE_CLOUD_BASE_URL", os.environ.get("RECCE_CLOUD_HOST", RECCE_CLOUD_API_HOST))
 
 DOCKER_INTERNAL_URL_PREFIX = "http://host.docker.internal"
 LOCALHOST_URL_PREFIX = "http://localhost"
@@ -34,6 +39,9 @@ class RecceCloudException(Exception):
             pass
         self.reason = reason
 
+    def __str__(self):
+        return f"{self.args[0]} [HTTP {self.status_code}] {self.reason}"
+
 
 class RecceCloud:
     def __init__(self, token: str):
@@ -42,6 +50,28 @@ class RecceCloud:
         self.token = token
         self.token_type = "github_token" if token.startswith(("ghp_", "gho_", "ghu_", "ghs_", "ghr_")) else "api_token"
         self.base_url = f"{RECCE_CLOUD_API_HOST}/api/v1"
+        self.base_url_v2 = f"{RECCE_CLOUD_API_HOST}/api/v2"
+
+        # Initialize modular clients
+        self._checks_client = None
+
+    @property
+    def checks(self) -> "ChecksCloud":
+        """
+        Get the checks client for check operations.
+
+        Returns:
+            ChecksCloud instance for check operations
+
+        Example:
+            >>> cloud = RecceCloud(token="your-token")
+            >>> checks = cloud.checks.list_checks("org", "proj", "sess")
+        """
+        if self._checks_client is None:
+            from recce.util.cloud import ChecksCloud
+
+            self._checks_client = ChecksCloud(self.token)
+        return self._checks_client
 
     def _request(self, method, url, headers: Dict = None, **kwargs):
         headers = {
@@ -81,6 +111,19 @@ class RecceCloud:
         response = self._fetch_presigned_url(method, repository, artifact_name, metadata, pr_id, branch)
         return response.get("presigned_url")
 
+    def _replace_localhost_with_docker_internal(self, url: str) -> str:
+        if url is None:
+            return None
+        if (
+            os.environ.get("RECCE_SHARE_INSTANCE_ENV") == "docker"
+            or os.environ.get("RECCE_TASK_INSTANCE_ENV") == "docker"
+            or os.environ.get("RECCE_INSTANCE_ENV") == "docker"
+        ):
+            # For local development, convert the presigned URL from localhost to host.docker.internal
+            if url.startswith(LOCALHOST_URL_PREFIX):
+                return url.replace(LOCALHOST_URL_PREFIX, DOCKER_INTERNAL_URL_PREFIX)
+        return url
+
     def get_presigned_url_by_share_id(
         self,
         method: PresignedUrlMethod,
@@ -89,10 +132,13 @@ class RecceCloud:
     ) -> str:
         response = self._fetch_presigned_url_by_share_id(method, share_id, metadata=metadata)
         presigned_url = response.get("presigned_url")
-        # Check if the CLI is running in Docker Recce Share Instance
-        if os.environ.get("RECCE_SHARE_INSTANCE_ENV") == "docker" and presigned_url.startswith(LOCALHOST_URL_PREFIX):
-            # For local development, convert the presigned URL from localhost to host.docker.internal
-            presigned_url = presigned_url.replace(LOCALHOST_URL_PREFIX, DOCKER_INTERNAL_URL_PREFIX)
+        if not presigned_url:
+            raise RecceCloudException(
+                message="Failed to get presigned URL from Recce Cloud.",
+                reason="No presigned URL returned from the server.",
+                status_code=404,
+            )
+        presigned_url = self._replace_localhost_with_docker_internal(presigned_url)
         return presigned_url
 
     def get_download_presigned_url_by_github_repo_with_tags(
@@ -167,12 +213,22 @@ class RecceCloud:
             )
         return response.json()
 
-    def purge_artifacts(self, pr_info: PullRequestInfo):
-        api_url = f"{self.base_url}/{pr_info.repository}/pulls/{pr_info.id}/artifacts"
+    def purge_artifacts(self, repository: str, pr_id: int = None, branch: str = None):
+        if pr_id is not None:
+            api_url = f"{self.base_url}/{repository}/pulls/{pr_id}/artifacts"
+            error_message = "Failed to purge artifacts from Recce Cloud."
+        elif branch is not None:
+            api_url = f"{self.base_url}/{repository}/commits/{branch}/artifacts"
+            error_message = "Failed to delete artifacts from Recce Cloud."
+        else:
+            raise ValueError(
+                "Please either run this command from within a pull request context "
+                "or specify a branch using the --branch option."
+            )
         response = self._request("DELETE", api_url)
         if response.status_code != 204:
             raise RecceCloudException(
-                message="Failed to purge artifacts from Recce Cloud.",
+                message=error_message,
                 reason=response.text,
                 status_code=response.status_code,
             )
@@ -222,28 +278,227 @@ class RecceCloud:
             )
         return response.json().get("user")
 
-    def set_onboarding_state(self, state: str):
-        api_url = f"{self.base_url}/users/onboarding-state"
-        try:
-            response = self._request("PUT", api_url, json={"state": state})
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            # Don't Raise an exception if setting onboarding_state fails
-            logger.warning(f"Failed to set Onboarding State in Recce Cloud. Reason: {str(e)}")
-        return
+    def get_session(self, session_id: str):
+        api_url = f"{self.base_url_v2}/sessions/{session_id}"
+        response = self._request("GET", api_url)
+        if response.status_code == 403:
+            return {"status": "error", "message": response.json().get("detail")}
+        if response.status_code != 200:
+            raise RecceCloudException(
+                message="Failed to get session from Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        data = response.json()
+        if data["success"] is not True:
+            raise RecceCloudException(
+                message="Failed to get session from Recce Cloud.",
+                reason=data.get("message", "Unknown error"),
+                status_code=response.status_code,
+            )
+        return data["session"]
 
+    def update_session(self, org_id: str, project_id: str, session_id: str, adapter_type: str):
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/projects/{project_id}/sessions/{session_id}"
+        data = {"adapter_type": adapter_type}
+        response = self._request("PATCH", api_url, json=data)
+        if response.status_code == 403:
+            return {"status": "error", "message": response.json().get("detail")}
+        if response.status_code != 200:
+            raise RecceCloudException(
+                message="Failed to update session in Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        return response.json()
 
-def get_recce_cloud_onboarding_state(token: str) -> str:
-    try:
-        recce_cloud = RecceCloud(token)
-        user_info = recce_cloud.get_user_info()
-        if user_info:
-            return user_info.get("onboarding_state")
-    except Exception as e:
-        logger.debug(str(e))
-    return "undefined"
+    def get_download_urls_by_session_id(self, org_id: str, project_id: str, session_id: str) -> dict[str, str]:
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/projects/{project_id}/sessions/{session_id}/download-url"
+        response = self._request("GET", api_url)
+        if response.status_code != 200:
+            raise RecceCloudException(
+                message="Failed to download session from Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        data = response.json()
+        if data["presigned_urls"] is None:
+            raise RecceCloudException(
+                message="No presigned URLs returned from the server.",
+                reason="",
+                status_code=404,
+            )
 
+        presigned_urls = data["presigned_urls"]
+        for key, url in presigned_urls.items():
+            presigned_urls[key] = self._replace_localhost_with_docker_internal(url)
+        return presigned_urls
 
-def set_recce_cloud_onboarding_state(token: str, new_state: str):
-    recce_cloud = RecceCloud(token)
-    recce_cloud.set_onboarding_state(new_state)
+    def get_base_session_download_urls(self, org_id: str, project_id: str, session_id: str = None) -> dict[str, str]:
+        """Get download URLs for the base session of a project.
+
+        If session_id is provided, the server resolves PR-specific base if available.
+        """
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/projects/{project_id}/base-session/download-url"
+        if session_id:
+            api_url += f"?session_id={session_id}"
+        response = self._request("GET", api_url)
+        if response.status_code != 200:
+            raise RecceCloudException(
+                message="Failed to download base session from Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        data = response.json()
+        if data["presigned_urls"] is None:
+            raise RecceCloudException(
+                message="No presigned URLs returned from the server.",
+                reason="",
+                status_code=404,
+            )
+
+        presigned_urls = data["presigned_urls"]
+        for key, url in presigned_urls.items():
+            presigned_urls[key] = self._replace_localhost_with_docker_internal(url)
+        return presigned_urls
+
+    def get_upload_urls_by_session_id(self, org_id: str, project_id: str, session_id: str) -> dict[str, str]:
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/projects/{project_id}/sessions/{session_id}/upload-url"
+        response = self._request("GET", api_url)
+        if response.status_code != 200:
+            raise RecceCloudException(
+                message="Failed to get upload URLs for session from Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        data = response.json()
+        if data["presigned_urls"] is None:
+            raise RecceCloudException(
+                message="No presigned URLs returned from the server.",
+                reason="",
+                status_code=404,
+            )
+
+        presigned_urls = data["presigned_urls"]
+        for key, url in presigned_urls.items():
+            presigned_urls[key] = self._replace_localhost_with_docker_internal(url)
+        return presigned_urls
+
+    def post_recce_state_uploaded_by_session_id(self, org_id: str, project_id: str, session_id: str):
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/projects/{project_id}/sessions/{session_id}/recce-state-uploaded"
+        response = self._request("POST", api_url)
+        if response.status_code != 204:
+            raise RecceCloudException(
+                message="Failed to notify state uploaded for session in Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+
+    def list_organizations(self) -> list:
+        """List all organizations the user has access to."""
+        api_url = f"{self.base_url_v2}/organizations"
+        response = self._request("GET", api_url)
+        if response.status_code != 200:
+            raise RecceCloudException(
+                message="Failed to list organizations from Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        data = response.json()
+        return data.get("organizations", [])
+
+    def list_projects(self, org_id: str) -> list:
+        """List all projects in an organization."""
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/projects"
+        response = self._request("GET", api_url)
+        if response.status_code != 200:
+            raise RecceCloudException(
+                message="Failed to list projects from Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        data = response.json()
+        return data.get("projects", [])
+
+    def list_sessions(self, org_id: str, project_id: str) -> list:
+        """List all sessions in a project."""
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/projects/{project_id}/sessions"
+        response = self._request("GET", api_url)
+        if response.status_code != 200:
+            raise RecceCloudException(
+                message="Failed to list sessions from Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        data = response.json()
+        return data.get("sessions", [])
+
+    def create_session(self, org_id: str, project_id: str, name: str, adapter_type: Optional[str] = None) -> dict:
+        """Create a new session in a project."""
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/projects/{project_id}/sessions"
+        data = {"name": name}
+        if adapter_type:
+            data["adapter_type"] = adapter_type
+        response = self._request("POST", api_url, json=data)
+        if response.status_code not in [200, 201]:
+            raise RecceCloudException(
+                message="Failed to create session in Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        result = response.json()
+        if "session" in result:
+            return result["session"]
+        return result
+
+    def upload_completed(self, session_id: str):
+        """Notify Recce Cloud that artifact upload is complete."""
+        api_url = f"{self.base_url_v2}/sessions/{session_id}/upload-completed"
+        response = self._request("POST", api_url)
+        if response.status_code not in [200, 204]:
+            raise RecceCloudException(
+                message="Failed to notify upload completion.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+
+    def create_warehouse_connection(self, org_id: str, name: str, config: dict) -> dict:
+        """Create a warehouse connection in an organization.
+
+        Cloud API: POST /v2/organizations/{org_id}/warehouse-connections
+        Request body: { name: str, config: dict }
+        Config must contain a 'type' field (e.g., 'snowflake', 'bigquery').
+        """
+        api_url = f"{self.base_url_v2}/organizations/{org_id}/warehouse-connections"
+        data = {"name": name, "config": config}
+        response = self._request("POST", api_url, json=data)
+        if response.status_code not in [200, 201]:
+            raise RecceCloudException(
+                message="Failed to create warehouse connection in Recce Cloud.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        result = response.json()
+        return result.get("warehouse_connection", result)
+
+    def bind_warehouse_connection_to_project(
+        self,
+        org_id: str,
+        project_id: str,
+        warehouse_connection_id: str,
+    ) -> dict:
+        """Bind a warehouse connection to a project.
+
+        Cloud API: PUT /v2/organizations/{org_id}/projects/{project_id}/warehouse-connection
+        Request body: { warehouse_connection_id: UUID }
+        """
+        api_url = f"{self.base_url_v2}/organizations/{org_id}" f"/projects/{project_id}/warehouse-connection"
+        data = {"warehouse_connection_id": warehouse_connection_id}
+        response = self._request("PUT", api_url, json=data)
+        if response.status_code not in [200, 201]:
+            raise RecceCloudException(
+                message="Failed to bind warehouse connection to project.",
+                reason=response.text,
+                status_code=response.status_code,
+            )
+        return response.json()

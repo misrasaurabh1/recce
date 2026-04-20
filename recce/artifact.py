@@ -10,7 +10,12 @@ import requests
 from rich.console import Console
 
 from recce.git import commit_hash_from_branch, current_branch, hosting_repo
-from recce.state import s3_sse_c_headers
+from recce.state import (
+    filter_headers_for_presigned_url,
+    normalize_s3_metadata,
+    s3_metadata_headers,
+    s3_sse_c_headers,
+)
 from recce.util.recce_cloud import PresignedUrlMethod, RecceCloud
 
 
@@ -40,7 +45,7 @@ def verify_artifacts_path(target_path: str) -> bool:
 
 
 def parse_dbt_version(file_path: str) -> str:
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     dbt_version = data.get("metadata", {}).get("dbt_version", None)
@@ -78,6 +83,64 @@ def archive_artifacts(target_path: str) -> (str, str):
         pass
 
     return artifacts_tar_gz_path, dbt_version
+
+
+def upload_artifacts_to_session(target_path: str, session_id: str, token: str, debug: bool = False):
+    """Upload dbt artifacts to a specific session ID in Recce Cloud."""
+    console = Console()
+    if verify_artifacts_path(target_path) is False:
+        console.print(f"[[red]Error[/red]] Invalid target path: {target_path}")
+        console.print("Please provide a valid target path containing manifest.json and catalog.json.")
+        return 1
+
+    manifest_path = os.path.join(target_path, "manifest.json")
+    catalog_path = os.path.join(target_path, "catalog.json")
+
+    # get the adapter type from the manifest file
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest_data = json.load(f)
+        adapter_type = manifest_data.get("metadata", {}).get("adapter_type")
+        if adapter_type is None:
+            raise Exception("Failed to parse adapter type from manifest.json")
+
+    recce_cloud = RecceCloud(token)
+
+    session = recce_cloud.get_session(session_id)
+
+    org_id = session.get("org_id")
+    if org_id is None:
+        raise Exception(f"Session ID {session_id} does not belong to any organization.")
+
+    project_id = session.get("project_id")
+    if project_id is None:
+        raise Exception(f"Session ID {session_id} does not belong to any project.")
+
+    # Get the presigned URL for uploading the artifacts using session ID
+    console.print(f'Uploading artifacts for session ID "{session_id}"')
+    presigned_urls = recce_cloud.get_upload_urls_by_session_id(org_id, project_id, session_id)
+    if debug:
+        console.rule("Debug information", style="blue")
+        console.print(f"Org ID: {org_id}")
+        console.print(f"Project ID: {project_id}")
+        console.print(f"Session ID: {session_id}")
+        console.print(f"Manifest path: {presigned_urls['manifest_url']}")
+        console.print(f"Catalog path: {presigned_urls['catalog_url']}")
+        console.print(f"Adapter type: {adapter_type}")
+
+    # Upload the compressed artifacts (no password needed for session uploads)
+    console.print(f'Uploading manifest from path "{manifest_path}"')
+    response = requests.put(presigned_urls["manifest_url"], data=open(manifest_path, "rb").read())
+    if response.status_code != 200 and response.status_code != 204:
+        raise Exception(response.text)
+    console.print(f'Uploading catalog from path "{catalog_path}"')
+    response = requests.put(presigned_urls["catalog_url"], data=open(catalog_path, "rb").read())
+    if response.status_code != 200 and response.status_code != 204:
+        raise Exception(response.text)
+
+    # Update the session metadata
+    recce_cloud.update_session(org_id, project_id, session_id, adapter_type)
+
+    return 0
 
 
 def upload_dbt_artifacts(target_path: str, branch: str, token: str, password: str, debug: bool = False):
@@ -122,9 +185,12 @@ def upload_dbt_artifacts(target_path: str, branch: str, token: str, password: st
 
     headers = s3_sse_c_headers(password)
     if metadata:
-        headers["x-amz-tagging"] = urlencode(metadata)
+        normalized = normalize_s3_metadata(metadata)
+        headers["x-amz-tagging"] = urlencode(normalized)
+        headers.update(s3_metadata_headers(metadata))
+    headers = filter_headers_for_presigned_url(presigned_url, headers)
     response = requests.put(presigned_url, data=open(compress_file_path, "rb").read(), headers=headers)
-    if response.status_code != 200:
+    if response.status_code not in (200, 204):
         raise Exception({response.text})
 
     # Clean up the compressed artifacts
@@ -191,3 +257,18 @@ def download_dbt_artifacts(
     except FileNotFoundError:
         pass
     return 0
+
+
+def delete_dbt_artifacts(branch: str, token: str, debug: bool = False):
+    """Delete dbt artifacts from a specific branch in Recce Cloud."""
+    console = Console()
+    repo = hosting_repo()
+
+    if debug:
+        console.rule("Debug information", style="blue")
+        console.print(f"Git Branch: {branch}")
+        console.print(f"GitHub repository: {repo}")
+
+    console.print(f'Deleting dbt artifacts from branch: "{branch}"')
+
+    RecceCloud(token).purge_artifacts(repo, branch=branch)

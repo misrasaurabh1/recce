@@ -7,6 +7,7 @@ from ..exceptions import RecceException
 from ..models import Check
 from .core import CheckValidator, Task, TaskResultDiffer
 from .dataframe import DataFrame
+from .utils import normalize_boolean_flag_columns, normalize_keys_to_columns
 
 
 class ValueDiffParams(BaseModel):
@@ -34,8 +35,11 @@ class ValueDiffMixin:
             if len(primary_key) == 0:
                 raise RecceException("Primary key cannot be empty")
             sql_template = r"""
-            {%- set column_list = primary_key %}
-            {%- set columns_csv = column_list | join(', ') %}
+            {%- set quoted_cols = [] %}
+            {%- for col in primary_key %}
+                {%- do quoted_cols.append(adapter.quote(col)) %}
+            {%- endfor %}
+            {%- set columns_csv = quoted_cols | join(', ') %}
 
             with validation_errors as (
                 select
@@ -91,6 +95,17 @@ class ValueDiffTask(Task, ValueDiffMixin):
         model: str,
         columns: List[str] = None,
     ):
+        """
+        Query value diff between base and current relations.
+        Compares column values between base and current relations using the primary key.
+        Mutates `self.params.primary_key` to normalize primary key names to match actual column names.
+
+        :param dbt_adapter: The dbt adapter instance.
+        :param primary_key: Single column name or list of column names for composite key.
+        :param model: The model name to compare.
+        :param columns: Optional list of columns to compare. If None, uses common columns.
+        :return: ValueDiffResult with summary and per-column match data, or None if invalid.
+        """
         import agate
 
         column_groups = {}
@@ -116,7 +131,7 @@ class ValueDiffTask(Task, ValueDiffMixin):
 
         {%- for field in primary_keys -%}
             {%- do fields.append(
-                "coalesce(cast(" ~ field ~ " as " ~ dbt.type_string() ~ "), '" ~ default_null_value  ~"')"
+                "coalesce(cast(" ~ adapter.quote(field) ~ " as " ~ dbt.type_string() ~ "), '" ~ default_null_value  ~"')"
             ) -%}
 
             {%- if not loop.last %}
@@ -134,19 +149,21 @@ class ValueDiffTask(Task, ValueDiffMixin):
             select {{ _pk }} as _pk, * from {{ curr_relation }}
         ),
 
+        {%- set _quoted_col = adapter.quote(column_to_compare) -%}
+
         joined as (
             select
                 coalesce(a_query._pk, b_query._pk) as _pk,
-                a_query.{{ column_to_compare }} as a_query_value,
-                b_query.{{ column_to_compare }} as b_query_value,
+                a_query.{{ _quoted_col }} as a_query_value,
+                b_query.{{ _quoted_col }} as b_query_value,
                 case
-                    when a_query.{{ column_to_compare }} = b_query.{{ column_to_compare }} then 'perfect match'
-                    when a_query.{{ column_to_compare }} is null and b_query.{{ column_to_compare }} is null then 'both are null'
+                    when a_query.{{ _quoted_col }} = b_query.{{ _quoted_col }} then 'perfect match'
+                    when a_query.{{ _quoted_col }} is null and b_query.{{ _quoted_col }} is null then 'both are null'
                     when a_query._pk is null then 'missing from {{ a_relation_name }}'
                     when b_query._pk is null then 'missing from {{ b_relation_name }}'
-                    when a_query.{{ column_to_compare }} is null then 'value is null in {{ a_relation_name }} only'
-                    when b_query.{{ column_to_compare }} is null then 'value is null in {{ b_relation_name }} only'
-                    when a_query.{{ column_to_compare }} != b_query.{{ column_to_compare }} then 'values do not match'
+                    when a_query.{{ _quoted_col }} is null then 'value is null in {{ a_relation_name }} only'
+                    when b_query.{{ _quoted_col }} is null then 'value is null in {{ b_relation_name }} only'
+                    when a_query.{{ _quoted_col }} != b_query.{{ _quoted_col }} then 'values do not match'
                     else 'unknown' -- this should never happen
                 end as match_status
             from a_query
@@ -180,6 +197,8 @@ class ValueDiffTask(Task, ValueDiffMixin):
                     curr_relation=dbt_adapter.create_relation(model, base=False),
                     primary_keys=primary_key if composite else [primary_key],
                     column_to_compare=column,
+                    a_relation_name="a",
+                    b_relation_name="b",
                 ),
             )
 
@@ -192,8 +211,8 @@ class ValueDiffTask(Task, ValueDiffMixin):
                 # ('EVENT_ID', 'perfect match', 158601510, Decimal('100.00'))
                 column_name, column_state, row_count, total_rate = row
                 if "column_name" == row[0].lower():
-                    # skip column names
-                    return
+                    # skip header row if database adapter returns column names as data
+                    continue
 
                 # sample data like this:
                 #     https://github.com/dbt-labs/dbt-audit-helper/blob/main/macros/compare_column_values.sql
@@ -218,10 +237,10 @@ class ValueDiffTask(Task, ValueDiffMixin):
                     "values do not match": "mismatched",
                 }
 
-                # Use the mapping to update counts
-                for state, action in state_mappings.items():
-                    if state in column_state:
-                        column_groups[column_name][action] += row_count
+                # Use exact matching to update counts
+                action = state_mappings.get(column_state)
+                if action:
+                    column_groups[column_name][action] += row_count
 
             # Cancel as early as possible
             self.check_cancel()
@@ -249,6 +268,16 @@ class ValueDiffTask(Task, ValueDiffMixin):
         column_names = ["column", "matched", "matched_p"]
         column_types = [agate.Text(), agate.Number(), agate.Number()]
         table = agate.Table(row, column_names=column_names, column_types=column_types)
+
+        # Normalize primary_key to match actual column keys
+        # For ValueDiff, 'columns' refers to the model's column list (from metadata), not a DataFrame result.
+        composite = isinstance(primary_key, list)
+        if composite:
+            self.params.primary_key = normalize_keys_to_columns(primary_key, columns)  # columns list from the model
+        else:
+            normalized = normalize_keys_to_columns([primary_key], columns)
+            if normalized:
+                self.params.primary_key = normalized[0]
 
         return ValueDiffResult(
             summary=ValueDiffResult.Summary(total=total, added=added, removed=removed),
@@ -353,61 +382,62 @@ class ValueDiffDetailTask(Task, ValueDiffMixin):
                 columns.insert(0, primary_key)
 
         sql_template = r"""
-        with a_query as (
-            select {{ columns | join(',\n') }} from {{ base_relation }}
-        ),
+                       {%- set _quoted_cols = [] -%}
+                       {%- for col in columns -%}
+                           {%- do _quoted_cols.append(adapter.quote(col)) -%}
+                       {%- endfor -%}
+                       {%- set _quoted_pks = [] -%}
+                       {%- for pk in primary_keys -%}
+                           {%- do _quoted_pks.append(adapter.quote(pk)) -%}
+                       {%- endfor -%}
 
-        b_query as (
-            select {{ columns | join(',\n') }} from {{ curr_relation }}
-        ),
+                       with a_query as (select {{ _quoted_cols | join (',\n') }}
+                       from {{ base_relation }}
+                           ), b_query as (
+                       select {{ _quoted_cols | join (',\n') }}
+                       from {{ curr_relation }}
+                           ), a_intersect_b as (
+                       select *
+                       from a_query
+                           {{ dbt.intersect() }}
+                       select *
+                       from b_query
+                           ), a_except_b as (
+                       select *
+                       from a_query
+                           {{ dbt.except() }}
+                       select *
+                       from b_query
+                           ), b_except_a as (
+                       select *
+                       from b_query
+                           {{ dbt.except() }}
+                       select *
+                       from a_query
+                           ), all_records as (
+                       select
+                           *, true as in_a, true as in_b
+                       from a_intersect_b
 
-        a_intersect_b as (
-            select * from a_query
-            {{ dbt.intersect() }}
-            select * from b_query
-        ),
+                       union all
 
-        a_except_b as (
-            select * from a_query
-            {{ dbt.except() }}
-            select * from b_query
-        ),
+                       select
+                           *, true as in_a, false as in_b
+                       from a_except_b
 
-        b_except_a as (
-            select * from b_query
-            {{ dbt.except() }}
-            select * from a_query
-        ),
+                       union all
 
-        all_records as (
-            select
-                *,
-                true as in_a,
-                true as in_b
-            from a_intersect_b
+                       select
+                           *, false as in_a, true as in_b
+                       from b_except_a
+                           )
 
-            union all
-
-            select
-                *,
-                true as in_a,
-                false as in_b
-            from a_except_b
-
-            union all
-
-            select
-                *,
-                false as in_a,
-                true as in_b
-            from b_except_a
-        )
-
-        select * from all_records
-        where not (in_a and in_b)
-        order by {{ primary_keys | join(',\n') }}, in_a desc, in_b desc
-        limit {{ limit }}
-        """
+                       select *
+                       from all_records
+                       where not (in_a and in_b)
+                       order by {{ _quoted_pks | join (',\n') }}, in_a desc, in_b desc
+                           limit {{ limit }}
+                       """
 
         sql = dbt_adapter.generate_sql(
             sql_template,
@@ -423,7 +453,21 @@ class ValueDiffDetailTask(Task, ValueDiffMixin):
         _, table = dbt_adapter.execute(sql, fetch=True)
         self.check_cancel()
 
-        return DataFrame.from_agate(table)
+        result_df = DataFrame.from_agate(table)
+        # Normalize in_a/in_b columns to lowercase for cross-warehouse consistency
+        result_df = normalize_boolean_flag_columns(result_df)
+
+        # Normalize primary_key to match actual column keys from result
+        column_keys = [col.key for col in result_df.columns]
+        composite = isinstance(primary_key, list)
+        if composite:
+            self.params.primary_key = normalize_keys_to_columns(primary_key, column_keys)
+        else:
+            normalized = normalize_keys_to_columns([primary_key], column_keys)
+            if normalized:
+                self.params.primary_key = normalized[0]
+
+        return result_df
 
     def execute(self):
         from recce.adapter.dbt_adapter import DbtAdapter

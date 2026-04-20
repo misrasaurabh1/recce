@@ -1,46 +1,20 @@
-import asyncio
 import os
 from pathlib import Path
 from typing import List
 
 import click
-import uvicorn
-from click import Abort
 
-from recce import event
-from recce.artifact import download_dbt_artifacts, upload_dbt_artifacts
-from recce.config import RECCE_CONFIG_FILE, RECCE_ERROR_LOG_FILE, RecceConfig
-from recce.connect_to_cloud import (
-    generate_key_pair,
-    prepare_connection_url,
-    run_one_time_http_server,
-)
-from recce.exceptions import RecceConfigException
-from recce.git import current_branch, current_default_branch
-from recce.run import check_github_ci_env, cli_run
-from recce.server import RecceServerMode
-from recce.state import (
-    CloudStateLoader,
-    FileStateLoader,
-    RecceCloudStateManager,
-    RecceShareStateManager,
-)
-from recce.summary import generate_markdown_summary
-from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
-from recce.util.logger import CustomFormatter
-from recce.util.onboarding_state import update_onboarding_state
-from recce.util.recce_cloud import (
-    RecceCloudException,
-)
+from recce.constants import RECCE_CONFIG_FILE, RECCE_ERROR_LOG_FILE
+from recce.util.startup_perf import track_timing
 
-from .core import RecceContext, set_default_context
-from .event.track import TrackCommand
-
-event.init()
+from .track import TrackCommand
 
 
 def create_state_loader(review_mode, cloud_mode, state_file, cloud_options):
     from rich.console import Console
+
+    from recce.state import CloudStateLoader, FileStateLoader
+    from recce.util.recce_cloud import RecceCloudException
 
     console = Console()
 
@@ -50,25 +24,104 @@ def create_state_loader(review_mode, cloud_mode, state_file, cloud_options):
             if cloud_mode
             else FileStateLoader(review_mode=review_mode, state_file=state_file)
         )
-        state_loader.load()
         return state_loader
     except RecceCloudException as e:
-        console.print("[[red]Error[/red]] Failed to load recce state file")
+        console.print("[[red]Error[/red]] Failed to create recce state loader")
         console.print(f"Reason: {e.reason}")
         exit(1)
     except Exception as e:
-        console.print("[[red]Error[/red]] Failed to load recce state file")
+        console.print("[[red]Error[/red]] Failed to create recce state loader")
         console.print(f"Reason: {e}")
         exit(1)
+
+
+def patch_derived_args(args):
+    """
+    Patch derived args based on other args.
+    """
+    if args.get("session_id") or args.get("share_url"):
+        args["cloud"] = True
+        args["review"] = True
+
+
+@track_timing("state_loader_init")
+def create_state_loader_by_args(state_file=None, **kwargs):
+    """
+    Create a state loader based on CLI arguments.
+
+    This function handles the cloud options logic that is shared between
+    server and mcp-server commands.
+
+    Args:
+        state_file: Optional path to state file
+        **kwargs: CLI arguments including api_token, cloud, review, session_id, share_url, etc.
+
+    Returns:
+        state_loader: The created state loader instance
+    """
+    from rich.console import Console
+
+    console = Console(stderr=True)
+
+    api_token = kwargs.get("api_token")
+    is_review = kwargs.get("review", False)
+    is_cloud = kwargs.get("cloud", False)
+    cloud_options = None
+
+    # Handle share_url and session_id
+    share_url = kwargs.get("share_url")
+    session_id = kwargs.get("session_id")
+
+    if share_url:
+        share_id = share_url.split("/")[-1]
+        if not share_id:
+            console.print("[[red]Error[/red]] Invalid share URL format.")
+            exit(1)
+
+    if is_cloud:
+        # Cloud mode
+        if share_url:
+            cloud_options = {
+                "host": kwargs.get("state_file_host"),
+                "api_token": api_token,
+                "share_id": share_id,
+            }
+        elif session_id:
+            cloud_options = {
+                "host": kwargs.get("state_file_host"),
+                "api_token": api_token,
+                "session_id": session_id,
+            }
+        else:
+            cloud_options = {
+                "host": kwargs.get("state_file_host"),
+                "github_token": kwargs.get("cloud_token"),
+                "password": kwargs.get("password"),
+            }
+
+    # Create state loader
+    state_loader = create_state_loader(is_review, is_cloud, state_file, cloud_options)
+
+    return state_loader
 
 
 def handle_debug_flag(**kwargs):
     if kwargs.get("debug"):
         import logging
 
+        from recce.util.logger import CustomFormatter
+
         ch = logging.StreamHandler()
         ch.setFormatter(CustomFormatter())
         logging.basicConfig(handlers=[ch], level=logging.DEBUG)
+
+        # Explicitly set uvicorn logger to DEBUG level
+        uvicorn_logger = logging.getLogger("uvicorn")
+        uvicorn_logger.setLevel(logging.DEBUG)
+
+        # Set all child loggers to DEBUG as well
+        for handler in uvicorn_logger.handlers:
+            handler.setLevel(logging.DEBUG)
 
 
 def add_options(options):
@@ -139,6 +192,15 @@ recce_cloud_options = [
     ),
 ]
 
+recce_cloud_auth_options = [
+    click.option(
+        "--api-token",
+        help="The personal token generated by Recce Cloud.",
+        type=click.STRING,
+        envvar="RECCE_API_TOKEN",
+    )
+]
+
 recce_dbt_artifact_dir_options = [
     click.option(
         "--target-path",
@@ -158,7 +220,7 @@ recce_hidden_options = [
     click.option(
         "--mode",
         envvar="RECCE_SERVER_MODE",
-        type=click.Choice(RecceServerMode.available_members(), case_sensitive=False),
+        type=click.Choice(["server", "preview", "read-only"], case_sensitive=False),
         hidden=True,
     ),
     click.option(
@@ -166,6 +228,13 @@ recce_hidden_options = [
         help="The share URL triggers this instance.",
         type=click.STRING,
         envvar="RECCE_SHARE_URL",
+        hidden=True,
+    ),
+    click.option(
+        "--session-id",
+        help="The session ID triggers this instance.",
+        type=click.STRING,
+        envvar=["RECCE_SESSION_ID", "RECCE_SNAPSHOT_ID"],  # Backward compatibility with RECCE_SNAPSHOT_ID
         hidden=True,
     ),
 ]
@@ -213,6 +282,464 @@ def version():
     from recce import __version__
 
     print(__version__)
+
+
+@cli.command(cls=TrackCommand)
+@add_options(dbt_related_options)
+@add_options(recce_dbt_artifact_dir_options)
+@add_options(recce_cloud_options)
+@add_options(recce_cloud_auth_options)
+@click.option(
+    "--cache-db",
+    help="Path to the column-level lineage cache database.",
+    type=click.Path(),
+    default=None,
+    show_default=False,
+)
+@click.option(
+    "--session-id",
+    help="Recce Cloud session ID (for --cloud mode).",
+    type=click.STRING,
+    envvar="RECCE_SESSION_ID",
+)
+def init(cache_db, **kwargs):
+    """
+    Pre-compute column-level lineage cache from dbt artifacts.
+
+    Computes column-level lineage for all models and stores results in a SQLite database
+    (~/.recce/cll_cache.db by default) so that subsequent `recce server`
+    sessions start with a warm cache.
+
+    With --cloud, downloads artifacts from Recce Cloud, computes CLL, and
+    uploads the cache and CLL map back to the session's S3 bucket.
+
+    Works with one or both environments (target/ and/or target-base/).
+    """
+
+    import json
+    import logging
+    import tempfile
+    import time
+
+    import requests
+    from rich.console import Console
+    from rich.progress import Progress
+
+    from recce.adapter.dbt_adapter import DbtAdapter
+    from recce.core import load_context
+    from recce.util.cll import _DEFAULT_DB_PATH, CllCache, get_cll_cache, set_cll_cache
+
+    logger = logging.getLogger("recce")
+    console = Console()
+    console.rule("Recce Init — Building column-level lineage cache", style="orange3")
+
+    # Timeouts for HTTP requests (seconds): short for metadata, long for large files
+    _METADATA_TIMEOUT = 30
+    _DOWNLOAD_TIMEOUT = 300
+    _UPLOAD_TIMEOUT = 600
+
+    is_cloud = kwargs.get("cloud", False)
+    session_id = kwargs.get("session_id")
+    cloud_client = None
+    cloud_org_id = None
+    cloud_project_id = None
+
+    if is_cloud:
+        from recce.util.recce_cloud import RecceCloud, RecceCloudException
+
+        cloud_token = kwargs.get("cloud_token") or kwargs.get("api_token")
+        if not cloud_token:
+            console.print("[[red]Error[/red]] --cloud requires --cloud-token or --api-token (or GITHUB_TOKEN env var).")
+            exit(1)
+        if not session_id:
+            console.print("[[red]Error[/red]] --cloud requires --session-id (or RECCE_SESSION_ID env var).")
+            exit(1)
+
+        cloud_client = RecceCloud(token=cloud_token)
+        if kwargs.get("state_file_host"):
+            host = kwargs["state_file_host"]
+            cloud_client.base_url = f"{host}/api/v1"
+            cloud_client.base_url_v2 = f"{host}/api/v2"
+
+        console.print(f"[bold]Cloud mode[/bold]: session {session_id}")
+
+        # Get session info
+        try:
+            session_info = cloud_client.get_session(session_id)
+        except RecceCloudException as e:
+            console.print(f"[[red]Error[/red]] Failed to get session: {e}")
+            exit(1)
+        if session_info.get("status") == "error":
+            console.print(f"[[red]Error[/red]] Failed to get session: {session_info.get('message', 'Access denied')}")
+            exit(1)
+        cloud_org_id = session_info.get("org_id")
+        cloud_project_id = session_info.get("project_id")
+        if not cloud_org_id or not cloud_project_id:
+            console.print(f"[[red]Error[/red]] Session {session_id} missing org_id or project_id.")
+            exit(1)
+
+        # Download artifacts to local target directories
+        console.print("Downloading artifacts from Cloud...")
+        try:
+            download_urls = cloud_client.get_download_urls_by_session_id(cloud_org_id, cloud_project_id, session_id)
+        except RecceCloudException as e:
+            console.print(f"[[red]Error[/red]] Failed to get download URLs: {e}")
+            exit(1)
+
+        project_dir_path = Path(kwargs.get("project_dir") or "./")
+        target_path = project_dir_path / kwargs.get("target_path", "target")
+        target_base_path = project_dir_path / kwargs.get("target_base_path", "target-base")
+        target_path.mkdir(parents=True, exist_ok=True)
+        target_base_path.mkdir(parents=True, exist_ok=True)
+
+        # Download current session artifacts
+        for artifact_key, filename in [("manifest_url", "manifest.json"), ("catalog_url", "catalog.json")]:
+            url = download_urls.get(artifact_key)
+            if url:
+                try:
+                    resp = requests.get(url, timeout=_METADATA_TIMEOUT)
+                    if resp.status_code == 200:
+                        (target_path / filename).write_bytes(resp.content)
+                        console.print(f"  Downloaded {filename} to {target_path}")
+                    else:
+                        console.print(
+                            f"  [[yellow]Warning[/yellow]] Failed to download {filename}: HTTP {resp.status_code}"
+                        )
+                except requests.RequestException as e:
+                    console.print(f"  [[yellow]Warning[/yellow]] Failed to download {filename}: {e}")
+
+        # Download base session artifacts
+        try:
+            base_download_urls = cloud_client.get_base_session_download_urls(
+                cloud_org_id, cloud_project_id, session_id=session_id
+            )
+        except RecceCloudException as e:
+            console.print(f"  [[yellow]Warning[/yellow]] Failed to get base session URLs: {e}")
+            base_download_urls = {}
+        for artifact_key, filename in [("manifest_url", "manifest.json"), ("catalog_url", "catalog.json")]:
+            url = base_download_urls.get(artifact_key)
+            if url:
+                try:
+                    resp = requests.get(url, timeout=_METADATA_TIMEOUT)
+                    if resp.status_code == 200:
+                        (target_base_path / filename).write_bytes(resp.content)
+                        console.print(f"  Downloaded base {filename} to {target_base_path}")
+                    else:
+                        console.print(
+                            f"  [[yellow]Warning[/yellow]] Failed to download base {filename}: HTTP {resp.status_code}"
+                        )
+                except requests.RequestException as e:
+                    console.print(f"  [[yellow]Warning[/yellow]] Failed to download base {filename}: {e}")
+
+        # Download existing CLL cache for warm start.
+        # Try current session first, then fall back to production (base) session.
+        # Use streaming to avoid loading large cache files entirely into memory.
+        if cache_db is None:
+            cache_db = _DEFAULT_DB_PATH
+        Path(cache_db).parent.mkdir(parents=True, exist_ok=True)
+
+        def _stream_download_to_file(url: str, dest: Path) -> int:
+            """Stream a URL to a file, returning bytes written. Raises on failure."""
+            resp = requests.get(url, stream=True, timeout=_DOWNLOAD_TIMEOUT)
+            if resp.status_code != 200:
+                return 0
+            total = 0
+            with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False, suffix=".tmp") as tmp:
+                tmp_path = Path(tmp.name)
+                try:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        tmp.write(chunk)
+                        total += len(chunk)
+                    tmp.flush()
+                except Exception:
+                    tmp_path.unlink(missing_ok=True)
+                    raise
+            if total > 0:
+                tmp_path.rename(dest)
+            else:
+                tmp_path.unlink(missing_ok=True)
+            return total
+
+        cache_downloaded = False
+        cll_cache_url = download_urls.get("cll_cache_url")
+        if cll_cache_url:
+            try:
+                nbytes = _stream_download_to_file(cll_cache_url, Path(cache_db))
+                if nbytes > 0:
+                    console.print(f"  Downloaded CLL cache from session ({nbytes / 1024 / 1024:.1f} MB)")
+                    cache_downloaded = True
+            except requests.RequestException as e:
+                console.print(f"  [[yellow]Warning[/yellow]] Failed to download CLL cache: {e}")
+
+        if not cache_downloaded:
+            # Fall back to production (base) session cache
+            base_cache_url = base_download_urls.get("cll_cache_url")
+            if base_cache_url:
+                try:
+                    nbytes = _stream_download_to_file(base_cache_url, Path(cache_db))
+                    if nbytes > 0:
+                        console.print(f"  Downloaded CLL cache from base session ({nbytes / 1024 / 1024:.1f} MB)")
+                        cache_downloaded = True
+                except requests.RequestException as e:
+                    console.print(f"  [[yellow]Warning[/yellow]] Failed to download base CLL cache: {e}")
+
+        if not cache_downloaded:
+            console.print("  [dim]No existing CLL cache found — will compute from scratch[/dim]")
+
+    if cache_db is None:
+        cache_db = _DEFAULT_DB_PATH
+
+    # Set up cache with SQLite persistence
+    set_cll_cache(CllCache(db_path=cache_db))
+
+    cache = get_cll_cache()
+    evicted = cache.evict_stale()
+    if evicted:
+        console.print(f"Evicted {evicted} stale cache entries (>7 days unused)")
+
+    # Check which artifact directories exist
+    if not is_cloud:
+        project_dir_path = Path(kwargs.get("project_dir") or "./")
+        target_path = project_dir_path / kwargs.get("target_path", "target")
+        target_base_path = project_dir_path / kwargs.get("target_base_path", "target-base")
+
+    has_target = (target_path / "manifest.json").is_file()
+    has_base = (target_base_path / "manifest.json").is_file()
+
+    if not has_target and not has_base:
+        console.print(
+            "[[yellow]Warning[/yellow]] No dbt artifacts found.\n"
+            f"  Checked: {target_path}/manifest.json\n"
+            f"  Checked: {target_base_path}/manifest.json\n\n"
+            "Run [bold]dbt docs generate[/bold] or [bold]dbt compile[/bold] first."
+        )
+        return
+
+    # If only one env exists, use it for both (so load_context doesn't fail)
+    context_kwargs = {**kwargs}
+    if has_target and not has_base:
+        console.print("[dim]Only target/ found — building cache for current environment only.[/dim]")
+        context_kwargs["target_base_path"] = kwargs.get("target_path", "target")
+    elif has_base and not has_target:
+        console.print("[dim]Only target-base/ found — building cache for base environment only.[/dim]")
+        context_kwargs["target_path"] = kwargs.get("target_base_path", "target-base")
+
+    try:
+        ctx = load_context(**context_kwargs)
+    except Exception as e:
+        console.print(f"[[red]Error[/red]] Failed to load context: {e}")
+        exit(1)
+
+    dbt_adapter: DbtAdapter = ctx.adapter
+
+    # Warn if catalog.json is missing — cache keys include column names from
+    # the catalog, so entries built without it will mismatch at server time.
+    catalog_missing = []
+    if has_target and not (target_path / "catalog.json").is_file():
+        catalog_missing.append(f"  {target_path}/catalog.json")
+    if has_base and not (target_base_path / "catalog.json").is_file():
+        catalog_missing.append(f"  {target_base_path}/catalog.json")
+    if catalog_missing:
+        console.print(
+            "[[yellow]Warning[/yellow]] catalog.json not found:\n"
+            + "\n".join(catalog_missing)
+            + "\n\nWithout it, cache entries will not match when the server loads a catalog.\n"
+            "Run [bold]dbt docs generate[/bold] before [bold]recce init[/bold] for best results."
+        )
+
+    envs = []
+    if has_target and dbt_adapter.curr_manifest:
+        curr_ids = [
+            nid
+            for nid in dbt_adapter.curr_manifest.nodes
+            if dbt_adapter.curr_manifest.nodes[nid].resource_type in ("model", "snapshot")
+        ]
+        envs.append(("current", curr_ids, False))
+
+    if has_base and dbt_adapter.base_manifest:
+        base_ids = [
+            nid
+            for nid in dbt_adapter.base_manifest.nodes
+            if dbt_adapter.base_manifest.nodes[nid].resource_type in ("model", "snapshot")
+        ]
+        envs.append(("base", base_ids, True))
+
+    with Progress(console=console, transient=True) as progress:
+        for env_name, node_ids, is_base in envs:
+            console.print(f"\n[bold]{env_name}[/bold] environment: {len(node_ids)} models")
+            t_start = time.perf_counter()
+
+            manifest = dbt_adapter.base_manifest if is_base else dbt_adapter.curr_manifest
+            catalog = dbt_adapter.base_catalog if is_base else dbt_adapter.curr_catalog
+            adapter_type = getattr(manifest.metadata, "adapter_type", None) or dbt_adapter.adapter.type()
+
+            success = 0
+            fail = 0
+            cache_hits = 0
+            batch_to_store = []
+
+            task = progress.add_task(f"  {env_name}", total=len(node_ids))
+
+            for nid in node_ids:
+                p_list: list = []
+                col_names: list = []
+                if nid in manifest.nodes:
+                    n = manifest.nodes[nid]
+                    if hasattr(n.depends_on, "nodes"):
+                        p_list = n.depends_on.nodes
+                    if catalog and nid in catalog.nodes:
+                        col_names = list(catalog.nodes[nid].columns.keys())
+
+                checksum = DbtAdapter._get_node_checksum(manifest, nid)
+                parent_checksums = [DbtAdapter._get_node_checksum(manifest, pid) for pid in p_list]
+                content_key = DbtAdapter._make_node_content_key(checksum, parent_checksums, col_names, adapter_type)
+                cached_json = cache.get_node(nid, content_key)
+                if cached_json:
+                    cache_hits += 1
+                    success += 1
+                    progress.advance(task)
+                    continue
+
+                try:
+                    cll_data = dbt_adapter.get_cll_cached(nid, base=is_base)
+                    if cll_data is None:
+                        fail += 1
+                        progress.advance(task)
+                        continue
+                    batch_to_store.append((nid, content_key, DbtAdapter._serialize_cll_data(cll_data)))
+                    success += 1
+                except Exception as e:
+                    fail += 1
+                    if fail <= 3:
+                        console.print(f"  [dim red]  skip: {nid}: {e}[/dim red]")
+                    logger.debug("[recce init] CLL computation failed for %s: %s", nid, e)
+                progress.advance(task)
+
+            if batch_to_store:
+                if not cache.put_nodes_batch(batch_to_store):
+                    console.print(
+                        f"  [[yellow]Warning[/yellow]] Failed to write {len(batch_to_store)} entries to cache."
+                    )
+
+            elapsed = time.perf_counter() - t_start
+            computed = len(batch_to_store)
+            if cache_hits == len(node_ids) and fail == 0:
+                console.print(f"  All {cache_hits} cached, {elapsed:.1f}s")
+            else:
+                parts = [f"{success} ok"]
+                if fail:
+                    parts.append(f"{fail} skipped")
+                parts.append(f"{elapsed:.1f}s")
+                if cache_hits:
+                    parts.append(f"{cache_hits} cached")
+                if computed:
+                    parts.append(f"{computed} computed")
+                console.print(f"  {', '.join(parts)}")
+
+            dbt_adapter.get_cll_cached.cache_clear()
+            if fail > 3:
+                console.print(f"  [dim]... and {fail - 3} more skipped (see logs for details)[/dim]")
+
+    # Build and save the full CLL map as JSON.
+    # The per-node SQLite cache is warm from the loop above, so this is fast.
+    console.print("\n[bold]Building full CLL map...[/bold]")
+    t_map_start = time.perf_counter()
+    cll_map_path = Path(cache_db).parent / "cll_map.json"
+    try:
+        full_cll_map = dbt_adapter.build_full_cll_map()
+        cll_map_data = full_cll_map.model_dump(mode="json")
+        # Write to temp file first to avoid corrupted JSON on partial write
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=cll_map_path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(cll_map_data, f)
+            Path(tmp_name).rename(cll_map_path)
+        except Exception:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+        map_elapsed = time.perf_counter() - t_map_start
+        map_size_mb = cll_map_path.stat().st_size / 1024 / 1024
+        console.print(
+            f"  CLL map saved to [bold]{cll_map_path}[/bold] "
+            f"({len(full_cll_map.nodes)} nodes, {len(full_cll_map.columns)} columns, "
+            f"{map_size_mb:.1f} MB, {map_elapsed:.1f}s)"
+        )
+    except Exception as e:
+        logger.warning("[recce init] Failed to build CLL map: %s", e)
+        console.print(f"  [[yellow]Warning[/yellow]] Failed to build CLL map: {e}")
+
+    stats = cache.stats
+    console.print(f"\nCache saved to [bold]{cache_db}[/bold] ({stats['entries']} entries)")
+
+    # Upload results to Cloud if in cloud mode
+    if is_cloud and cloud_client:
+        console.print("\n[bold]Uploading results to Cloud...[/bold]")
+        upload_failures = []
+        try:
+            upload_urls = cloud_client.get_upload_urls_by_session_id(cloud_org_id, cloud_project_id, session_id)
+
+            # Upload CLL map
+            cll_map_upload_url = upload_urls.get("cll_map_url")
+            if cll_map_upload_url and cll_map_path.is_file():
+                try:
+                    with open(cll_map_path, "rb") as f:
+                        resp = requests.put(
+                            cll_map_upload_url,
+                            data=f,
+                            headers={"Content-Type": "application/json"},
+                            timeout=_UPLOAD_TIMEOUT,
+                        )
+                    if resp.status_code in (200, 204):
+                        console.print(f"  Uploaded cll_map.json ({cll_map_path.stat().st_size / 1024 / 1024:.1f} MB)")
+                    else:
+                        upload_failures.append("cll_map.json")
+                        console.print(
+                            f"  [[yellow]Warning[/yellow]] Failed to upload cll_map.json: HTTP {resp.status_code}"
+                        )
+                except requests.RequestException as e:
+                    upload_failures.append("cll_map.json")
+                    console.print(f"  [[yellow]Warning[/yellow]] Failed to upload cll_map.json: {e}")
+            elif not cll_map_upload_url:
+                console.print(
+                    "  [[yellow]Warning[/yellow]] No cll_map_url in upload URLs (Cloud server may need update)"
+                )
+
+            # Upload CLL cache
+            cll_cache_upload_url = upload_urls.get("cll_cache_url")
+            if cll_cache_upload_url and Path(cache_db).is_file():
+                try:
+                    with open(cache_db, "rb") as f:
+                        resp = requests.put(
+                            cll_cache_upload_url,
+                            data=f,
+                            headers={"Content-Type": "application/octet-stream"},
+                            timeout=_UPLOAD_TIMEOUT,
+                        )
+                    if resp.status_code in (200, 204):
+                        console.print(f"  Uploaded cll_cache.db ({Path(cache_db).stat().st_size / 1024 / 1024:.1f} MB)")
+                    else:
+                        upload_failures.append("cll_cache.db")
+                        console.print(
+                            f"  [[yellow]Warning[/yellow]] Failed to upload cll_cache.db: HTTP {resp.status_code}"
+                        )
+                except requests.RequestException as e:
+                    upload_failures.append("cll_cache.db")
+                    console.print(f"  [[yellow]Warning[/yellow]] Failed to upload cll_cache.db: {e}")
+            elif not cll_cache_upload_url:
+                logger.debug("No cll_cache_url in upload URLs — cache upload not supported yet")
+
+            if upload_failures:
+                console.print(
+                    f"[bold yellow]Cloud upload completed with warnings[/bold yellow] "
+                    f"(failed: {', '.join(upload_failures)})"
+                )
+            else:
+                console.print("[bold green]Cloud upload complete.[/bold green]")
+        except Exception as e:
+            logger.warning("[recce init] Cloud upload failed: %s", e)
+            console.print(f"  [[yellow]Warning[/yellow]] Cloud upload failed: {e}")
+    else:
+        console.print("Run [bold]recce server --enable-cll-cache[/bold] to use the cached lineage.")
 
 
 @cli.command(cls=TrackCommand)
@@ -328,6 +855,8 @@ def query(sql, base: bool = False, **kwargs):
     - run an adhoc query on base environment\n
         recce query --base --sql 'select * from {{ ref("mymodel") }} order by 1'
     """
+    from .core import RecceContext
+
     context = RecceContext.load(**kwargs)
     result = _execute_sql(context, sql, base=base)
     print(result.to_string(na_rep="-", index=False))
@@ -360,6 +889,8 @@ def diff(sql, primary_keys: List[str] = None, keep_shape: bool = False, keep_equ
         recce diff --sql 'select * from {{ ref("mymodel") }} order by 1'
     """
 
+    from .core import RecceContext
+
     context = RecceContext.load(**kwargs)
     before = _execute_sql(context, sql, base=True)
     if primary_keys is not None:
@@ -380,18 +911,42 @@ def diff(sql, primary_keys: List[str] = None, keep_shape: bool = False, keep_equ
 @click.option("--host", default="localhost", show_default=True, help="The host to bind to.")
 @click.option("--port", default=8000, show_default=True, help="The port to bind to.", type=int)
 @click.option("--lifetime", default=0, show_default=True, help="The lifetime of the server in seconds.", type=int)
+@click.option(
+    "--idle-timeout",
+    default=0,
+    show_default=True,
+    help="The idle timeout in seconds. If 0, idle timeout is disabled. Maximum value is capped by lifetime.",
+    type=int,
+)
 @click.option("--review", is_flag=True, help="Open the state file in the review mode.")
 @click.option("--single-env", is_flag=True, help="Launch in single environment mode directly.")
 @click.option(
-    "--api-token", help="The personal token generated by Recce Cloud.", type=click.STRING, envvar="RECCE_API_TOKEN"
+    "--enable-cll-cache",
+    is_flag=True,
+    help="Enable the pre-cached full column-level lineage map.",
+    envvar="ENABLE_CLL_CACHE",
+)
+@click.option(
+    "--impact-at-startup",
+    is_flag=True,
+    help="Automatically run impact analysis when the UI loads.",
+    envvar="RECCE_IMPACT_AT_STARTUP",
+    hidden=True,
+)
+@click.option(
+    "--new-cll-experience",
+    is_flag=True,
+    help="Enable the new column-level lineage visual experience.",
+    envvar="RECCE_NEW_CLL_EXPERIENCE",
 )
 @add_options(dbt_related_options)
 @add_options(sqlmesh_related_options)
 @add_options(recce_options)
 @add_options(recce_dbt_artifact_dir_options)
 @add_options(recce_cloud_options)
+@add_options(recce_cloud_auth_options)
 @add_options(recce_hidden_options)
-def server(host, port, lifetime, state_file=None, **kwargs):
+def server(host, port, lifetime, idle_timeout=0, state_file=None, **kwargs):
     """
     Launch the recce server
 
@@ -417,30 +972,49 @@ def server(host, port, lifetime, state_file=None, **kwargs):
     recce server --cloud
     recce server --review --cloud
 
-    \b
-    # Launch the server using the state from a shared URL. (Requires Recce API token)
-    export RECCE_API_TOKEN=<your-recce-api-token>
-    recce server --cloud --share-url <share-url>
-
     """
 
+    import uvicorn
     from rich.console import Console
     from rich.prompt import Confirm
+
+    from recce.config import RecceConfig
+    from recce.exceptions import RecceConfigException
+    from recce.server import RecceServerMode
+    from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
 
     from .server import AppState, app
 
     RecceConfig(config_file=kwargs.get("config"))
 
+    # Initialize startup performance tracking
+    from recce.util.startup_perf import StartupPerfTracker, set_startup_tracker
+
+    startup_tracker = StartupPerfTracker()
+    set_startup_tracker(startup_tracker)
+
     handle_debug_flag(**kwargs)
+    patch_derived_args(kwargs)
+
     server_mode = kwargs.get("mode") if kwargs.get("mode") else RecceServerMode.server
     is_review = kwargs.get("review", False)
     is_cloud = kwargs.get("cloud", False)
-    flag = {}
+    startup_tracker.set_cloud_mode(is_cloud)
+    flag = {
+        "single_env_onboarding": False,
+        "show_relaunch_hint": False,
+        "preview": False,
+        "read_only": False,
+        "disable_cll_cache": True,
+        "impact_at_startup": False,
+        "new_cll_experience": False,
+    }
     console = Console()
-    cloud_options = None
 
+    # Prepare API token
     try:
         api_token = prepare_api_token(**kwargs)
+        kwargs["api_token"] = api_token
     except RecceConfigException:
         show_invalid_api_token_message()
         exit(1)
@@ -448,119 +1022,57 @@ def server(host, port, lifetime, state_file=None, **kwargs):
         "api_token": api_token,
     }
 
-    share_url = kwargs.get("share_url")
-    if share_url:
-        share_id = share_url.split("/")[-1]
-        if not share_id:
-            console.print("[[red]Error[/red]] Invalid share URL format.")
-            exit(1)
-
-    if server_mode == RecceServerMode.server:
-        flag = {"single_env_onboarding": False, "show_relaunch_hint": False}
-        if is_cloud:
-            if share_url:
-                # recce server --cloud --share-url <share-url>
-                # Use state file stored for the share url
-                # Forces use of the review mode.
-                is_review = kwargs["review"] = True
-                cloud_options = {
-                    "host": kwargs.get("state_file_host"),
-                    "api_token": api_token,
-                    "share_id": share_id,
-                }
-            else:
-                # recce server --cloud
-                # recce server --cloud --review
-                # Use state file stored for the PR of the current branch
-                cloud_options = {
-                    "host": kwargs.get("state_file_host"),
-                    "github_token": kwargs.get("cloud_token"),
-                    "password": kwargs.get("password"),
-                }
-
-        # Check Single Environment Onboarding Mode if the review mode is False
+    # Check Single Environment Onboarding Mode if not in cloud mode and not in review mode
+    if not is_cloud and not is_review:
         project_dir_path = Path(kwargs.get("project_dir") or "./")
         target_base_path = project_dir_path.joinpath(Path(kwargs.get("target_base_path", "target-base")))
-        if not target_base_path.is_dir() and not is_review:
+        if not target_base_path.is_dir():
             # Mark as single env onboarding mode if user provides the target-path only
             flag["single_env_onboarding"] = True
             flag["show_relaunch_hint"] = True
             # Use the target path as the base path
             kwargs["target_base_path"] = kwargs.get("target_path")
-    elif server_mode == RecceServerMode.preview:
-        if is_cloud:
-            # recce server --cloud --share-url <share-url> --mode preview
-            # Use state file stored for the share url
-            #
-            # Preview mode disable these features
-            # - run query
-            #
-            # Usage:
-            #    Used in cloud managed instance. For cloud onboarding to preview the uploaded artifacts.
-            cloud_options = {
-                "host": kwargs.get("state_file_host"),
-                "api_token": api_token,
-                "share_id": share_id,
-            }
-        else:
-            # recce server --mode preview recce_state.json
-            if state_file is None:
-                console.print("[[red]Error[/red]] The state_file is required in 'Preview' mode.")
-                console.print("Please provide recce_state json file exported by Recce OSS.")
-                exit(1)
-        is_review = kwargs["review"] = True
-        flag = {
-            "preview": True,
-        }
+
+    # Server mode:
+    #
+    # It's used to determine the features disabled in the Web UI. Only used in the cloud-managed recce instances.
+    #
+    # Read-Only: No run query, no checklist
+    # Preview (Metadata-Only): No run query
+    if server_mode == RecceServerMode.preview:
+        flag["preview"] = True
     elif server_mode == RecceServerMode.read_only:
-        if is_cloud:
-            # recce server --cloud --share-url <share-url> --mode read-only
-            # Use state file stored for the share url
-            #
-            # Read-only mode disable these features
-            # - run query
-            # - use checklist
-            # - share
-            #
-            # Usage:
-            #    Used in cloud managed instance. Launch when user click a share link.
-            cloud_options = {
-                "host": kwargs.get("state_file_host"),
-                "api_token": api_token,
-                "share_id": share_id,
-            }
-        else:
-            # recce server --mode read-only recce_state.json
-            if state_file is None:
-                console.print("[[red]Error[/red]] The state_file is required in 'Read-Only' mode.")
-                console.print("Please provide recce_state json file exported by Recce OSS.")
-                exit(1)
-        is_review = kwargs["review"] = True
-        flag = {
-            "read_only": True,
-        }
+        flag["read_only"] = True
 
-    # Onboarding State logic update here
-    update_onboarding_state(api_token, flag.get("single_env_onboarding"))
+    if kwargs.get("enable_cll_cache", False):
+        flag["disable_cll_cache"] = False
+        from recce.util.cll import CllCache, set_cll_cache
 
-    state_loader = create_state_loader(is_review, is_cloud, state_file, cloud_options)
+        cache_db = os.environ.get("CLL_CACHE_DB", None)
+        if cache_db is None:
+            from recce.util.cll import _DEFAULT_DB_PATH
+
+            cache_db = _DEFAULT_DB_PATH
+        set_cll_cache(CllCache(db_path=cache_db))
+
+    if kwargs.get("impact_at_startup", False):
+        flag["impact_at_startup"] = True
+
+    if kwargs.get("new_cll_experience", False):
+        flag["new_cll_experience"] = True
+
+    # Create state loader using shared function
+    from recce.util.startup_perf import get_startup_tracker
+
+    state_loader = create_state_loader_by_args(state_file, **kwargs)
+
+    if (tracker := get_startup_tracker()) and hasattr(state_loader, "catalog"):
+        tracker.set_catalog_type(state_loader.catalog)
 
     if not state_loader.verify():
         error, hint = state_loader.error_and_hint
         console.print(f"[[red]Error[/red]] {error}")
         console.print(f"{hint}")
-        exit(1)
-
-    try:
-        result, message = RecceContext.verify_required_artifacts(**kwargs)
-    except Exception as e:
-        result = False
-        error_type = type(e).__name__
-        error_message = str(e)
-        message = f"{error_type}: {error_message}"
-    if not result:
-        console.rule("Notice", style="orange3")
-        console.print(f"[[red]Error[/red]] {message}")
         exit(1)
 
     if state_loader.review_mode:
@@ -572,7 +1084,7 @@ def server(host, port, lifetime, state_file=None, **kwargs):
             "Recce will launch with limited features (no environment comparison).\n"
             "\n"
             "For full functionality, set up a base environment first.\n"
-            "Setup help: 'recce debug' or https://docs.datarecce.io/configure-diff/\n"
+            "Setup help: 'recce debug' or https://docs.reccehq.com/configure-diff/\n"
         )
 
         single_env_flag = kwargs.get("single_env", False)
@@ -585,6 +1097,22 @@ def server(host, port, lifetime, state_file=None, **kwargs):
     else:
         console.rule("Recce Server")
 
+    # Validate idle_timeout: cap at lifetime if it exceeds lifetime
+    if idle_timeout > 0:
+        # If lifetime is set (> 0) and idle_timeout exceeds it, cap to lifetime
+        if lifetime > 0 and idle_timeout > lifetime:
+            effective_idle_timeout = lifetime
+            console.print(
+                f"[[yellow]Warning[/yellow]] idle_timeout ({idle_timeout}s) exceeds lifetime ({lifetime}s). "
+                f"Capping idle_timeout to {effective_idle_timeout}s."
+            )
+        else:
+            # Use idle_timeout as-is (either lifetime is 0, or idle_timeout <= lifetime)
+            effective_idle_timeout = idle_timeout
+    else:
+        # idle_timeout is 0 or negative, disable idle timeout
+        effective_idle_timeout = 0
+
     state = AppState(
         command=server_mode,
         state_loader=state_loader,
@@ -592,12 +1120,12 @@ def server(host, port, lifetime, state_file=None, **kwargs):
         flag=flag,
         auth_options=auth_options,
         lifetime=lifetime,
+        idle_timeout=effective_idle_timeout,
         share_url=kwargs.get("share_url"),
+        organization_name=os.environ.get("RECCE_SESSION_ORGANIZATION_NAME"),
+        web_url=os.environ.get("RECCE_CLOUD_WEB_URL"),
     )
     app.state = state
-
-    if server_mode == RecceServerMode.read_only:
-        set_default_context(RecceContext.load(**kwargs, state_loader=state_loader))
 
     uvicorn.run(app, host=host, port=port, lifespan="on")
 
@@ -635,6 +1163,8 @@ DEFAULT_RECCE_STATE_FILE = "recce_state.json"
 @add_options(recce_options)
 @add_options(recce_dbt_artifact_dir_options)
 @add_options(recce_cloud_options)
+@add_options(recce_cloud_auth_options)
+@add_options(recce_hidden_options)
 def run(output, **kwargs):
     """
     Run recce and output the state file
@@ -654,7 +1184,16 @@ def run(output, **kwargs):
     recce run --cloud --cloud-token <token> --password <password>
 
     """
+    import asyncio
+
     from rich.console import Console
+
+    from recce.config import RecceConfig
+    from recce.exceptions import RecceConfigException
+    from recce.run import check_github_ci_env, cli_run
+    from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
+
+    from .core import RecceContext
 
     handle_debug_flag(**kwargs)
     console = Console()
@@ -665,21 +1204,22 @@ def run(output, **kwargs):
     # Initialize Recce Config
     RecceConfig(config_file=kwargs.get("config"))
 
-    cloud_mode = kwargs.get("cloud", False)
-    state_file = kwargs.get("state_file")
-    cloud_options = (
-        {
-            "host": kwargs.get("state_file_host"),
-            "github_token": kwargs.get("cloud_token"),
-            "password": kwargs.get("password"),
-        }
-        if cloud_mode
-        else None
-    )
+    patch_derived_args(kwargs)
+    # Remove share_url from kwargs to avoid affecting state loader creation
+    kwargs.pop("share_url", None)
 
-    state_loader = create_state_loader(
-        review_mode=False, cloud_mode=cloud_mode, state_file=state_file, cloud_options=cloud_options
-    )
+    state_file = kwargs.pop("state_file", None)
+
+    # Prepare API token
+    try:
+        api_token = prepare_api_token(**kwargs)
+        kwargs["api_token"] = api_token
+    except RecceConfigException:
+        show_invalid_api_token_message()
+        exit(1)
+
+    # Create state loader using shared function
+    state_loader = create_state_loader_by_args(state_file, **kwargs)
 
     if not state_loader.verify():
         error, hint = state_loader.error_and_hint
@@ -736,6 +1276,8 @@ def summary(state_file, **kwargs):
     """
     from rich.console import Console
 
+    from recce.summary import generate_markdown_summary
+
     from .core import load_context
 
     handle_debug_flag(**kwargs)
@@ -754,6 +1296,7 @@ def summary(state_file, **kwargs):
     state_loader = create_state_loader(
         review_mode=True, cloud_mode=cloud_mode, state_file=state_file, cloud_options=cloud_options
     )
+    state_loader.load()
 
     if not state_loader.verify():
         error, hint = state_loader.error_and_hint
@@ -780,6 +1323,12 @@ def connect_to_cloud():
     import webbrowser
 
     from rich.console import Console
+
+    from recce.connect_to_cloud import (
+        generate_key_pair,
+        prepare_connection_url,
+        run_one_time_http_server,
+    )
 
     console = Console()
 
@@ -828,6 +1377,8 @@ def purge(**kwargs):
     """
     from rich.console import Console
 
+    from recce.state import RecceCloudStateManager
+
     handle_debug_flag(**kwargs)
     console = Console()
     state_loader = None
@@ -843,6 +1394,7 @@ def purge(**kwargs):
         state_loader = create_state_loader(
             review_mode=False, cloud_mode=True, state_file=None, cloud_options=cloud_options
         )
+        state_loader.load()
     except Exception:
         console.print("[[yellow]Skip[/yellow]] Cannot access existing state file from cloud. Purge it directly.")
 
@@ -911,6 +1463,8 @@ def upload(state_file, **kwargs):
     """
     from rich.console import Console
 
+    from recce.state import RecceCloudStateManager
+
     handle_debug_flag(**kwargs)
     cloud_options = {
         "host": kwargs.get("state_file_host"),
@@ -924,6 +1478,7 @@ def upload(state_file, **kwargs):
     state_loader = create_state_loader(
         review_mode=False, cloud_mode=False, state_file=state_file, cloud_options=cloud_options
     )
+    state_loader.load()
 
     if not state_loader.verify():
         error, hint = state_loader.error_and_hint
@@ -979,6 +1534,8 @@ def download(**kwargs):
     """
     from rich.console import Console
 
+    from recce.state import RecceCloudStateManager
+
     handle_debug_flag(**kwargs)
     filepath = kwargs.get("output")
     cloud_options = {
@@ -1012,11 +1569,9 @@ def download(**kwargs):
 @click.option(
     "--branch",
     "-b",
-    help="The branch of the provided artifacts.",
+    help="The branch of the provided artifacts. Defaults to current branch.",
     type=click.STRING,
     envvar="GITHUB_HEAD_REF",
-    default=current_branch(),
-    show_default=True,
 )
 @click.option(
     "--target-path",
@@ -1046,11 +1601,14 @@ def upload_artifacts(**kwargs):
     """
     from rich.console import Console
 
+    from recce.artifact import upload_dbt_artifacts
+    from recce.git import current_branch
+
     console = Console()
     cloud_token = kwargs.get("cloud_token")
     password = kwargs.get("password")
     target_path = kwargs.get("target_path")
-    branch = kwargs.get("branch")
+    branch = kwargs.get("branch") or current_branch()
 
     try:
         rc = upload_dbt_artifacts(
@@ -1069,6 +1627,8 @@ def upload_artifacts(**kwargs):
 
 
 def _download_artifacts(branch, cloud_token, console, kwargs, password, target_path):
+    from recce.artifact import download_dbt_artifacts
+
     try:
         rc = download_dbt_artifacts(
             target_path,
@@ -1109,11 +1669,9 @@ def _download_artifacts(branch, cloud_token, console, kwargs, password, target_p
 @click.option(
     "--branch",
     "-b",
-    help="The branch of the selected artifacts.",
+    help="The branch of the selected artifacts. Defaults to current branch.",
     type=click.STRING,
     envvar="GITHUB_BASE_REF",
-    default=current_branch(),
-    show_default=True,
 )
 @click.option(
     "--target-path",
@@ -1144,11 +1702,13 @@ def download_artifacts(**kwargs):
     """
     from rich.console import Console
 
+    from recce.git import current_branch
+
     console = Console()
     cloud_token = kwargs.get("cloud_token")
     password = kwargs.get("password")
     target_path = kwargs.get("target_path")
-    branch = kwargs.get("branch")
+    branch = kwargs.get("branch") or current_branch()
     return _download_artifacts(branch, cloud_token, console, kwargs, password, target_path)
 
 
@@ -1157,11 +1717,9 @@ def download_artifacts(**kwargs):
 @click.option(
     "--branch",
     "-b",
-    help="The branch of the selected artifacts.",
+    help="The branch of the selected artifacts. Defaults to default branch.",
     type=click.STRING,
     envvar="GITHUB_BASE_REF",
-    default=current_default_branch(),
-    show_default=True,
 )
 @click.option(
     "--target-path",
@@ -1191,11 +1749,13 @@ def download_base_artifacts(**kwargs):
     """
     from rich.console import Console
 
+    from recce.git import current_default_branch
+
     console = Console()
     cloud_token = kwargs.get("cloud_token")
     password = kwargs.get("password")
     target_path = kwargs.get("target_path")
-    branch = kwargs.get("branch")
+    branch = kwargs.get("branch") or current_default_branch()
     # If recce can't infer default branch from "GITHUB_BASE_REF" and current_default_branch()
     if branch is None:
         console.print(
@@ -1204,6 +1764,291 @@ def download_base_artifacts(**kwargs):
         exit(1)
 
     return _download_artifacts(branch, cloud_token, console, kwargs, password, target_path)
+
+
+@cloud.command(cls=TrackCommand)
+@click.option("--cloud-token", help="The GitHub token used by Recce Cloud.", type=click.STRING, envvar="GITHUB_TOKEN")
+@click.option(
+    "--branch",
+    "-b",
+    help="The branch to delete artifacts from. Defaults to current branch.",
+    type=click.STRING,
+    envvar="GITHUB_HEAD_REF",
+)
+@click.option("--force", "-f", help="Bypasses the confirmation prompt. Delete the artifacts directly.", is_flag=True)
+@add_options(recce_options)
+def delete_artifacts(**kwargs):
+    """
+    Delete the dbt artifacts from cloud
+
+    Delete the dbt artifacts (metadata.json, catalog.json) from Recce Cloud for the given branch.
+    This will permanently remove the artifacts from the cloud storage.
+
+    By default, the artifacts are deleted from the current branch. You can specify the branch using the --branch option.
+    """
+    from rich.console import Console
+
+    from recce.artifact import delete_dbt_artifacts
+    from recce.git import current_branch
+    from recce.util.recce_cloud import RecceCloudException
+
+    console = Console()
+    cloud_token = kwargs.get("cloud_token")
+    branch = kwargs.get("branch") or current_branch()
+    force = kwargs.get("force", False)
+
+    if not force:
+        if not click.confirm(f'Do you want to delete artifacts from branch "{branch}"?'):
+            console.print("Deletion cancelled.")
+            return 0
+
+    try:
+        delete_dbt_artifacts(branch=branch, token=cloud_token, debug=kwargs.get("debug", False))
+        console.print(f"[[green]Success[/green]] Artifacts deleted from branch: {branch}")
+        return 0
+    except click.exceptions.Abort:
+        pass
+    except RecceCloudException as e:
+        console.print("[[red]Error[/red]] Failed to delete the dbt artifacts from cloud.")
+        console.print(f"Reason: {e.reason}")
+        exit(1)
+    except Exception as e:
+        console.print("[[red]Error[/red]] Failed to delete the dbt artifacts from cloud.")
+        console.print(f"Reason: {e}")
+        exit(1)
+
+
+@cloud.command(cls=TrackCommand, name="list-organizations")
+@click.option("--api-token", help="The Recce Cloud API token.", type=click.STRING, envvar="RECCE_API_TOKEN")
+@add_options(recce_options)
+def list_organizations(**kwargs):
+    """
+    List organizations from Recce Cloud
+
+    Lists all organizations that the authenticated user has access to.
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from recce.exceptions import RecceConfigException
+    from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
+    from recce.util.recce_cloud import RecceCloudException
+
+    console = Console()
+    handle_debug_flag(**kwargs)
+
+    try:
+        api_token = prepare_api_token(**kwargs)
+    except RecceConfigException:
+        show_invalid_api_token_message()
+        exit(1)
+
+    try:
+        from recce.util.recce_cloud import RecceCloud
+
+        cloud = RecceCloud(api_token)
+        organizations = cloud.list_organizations()
+
+        if not organizations:
+            console.print("No organizations found.")
+            return
+
+        table = Table(title="Organizations")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="green")
+        table.add_column("Display Name", style="yellow")
+
+        for org in organizations:
+            table.add_row(str(org.get("id", "")), org.get("name", ""), org.get("display_name", ""))
+
+        console.print(table)
+
+    except RecceCloudException as e:
+        console.print(f"[[red]Error[/red]] {e}")
+        exit(1)
+    except Exception as e:
+        console.print(f"[[red]Error[/red]] {e}")
+        exit(1)
+
+
+@cloud.command(cls=TrackCommand, name="list-projects")
+@click.option(
+    "--organization",
+    "-o",
+    help="Organization ID (can also be set via RECCE_ORGANIZATION_ID environment variable)",
+    type=click.STRING,
+    envvar="RECCE_ORGANIZATION_ID",
+)
+@click.option("--api-token", help="The Recce Cloud API token.", type=click.STRING, envvar="RECCE_API_TOKEN")
+@add_options(recce_options)
+def list_projects(**kwargs):
+    """
+    List projects from Recce Cloud
+
+    Lists all projects in the specified organization that the authenticated user has access to.
+
+    Examples:
+
+        # Using environment variable
+        export RECCE_ORGANIZATION_ID=8
+        recce cloud list-projects
+
+        # Using command line argument
+        recce cloud list-projects --organization 8
+
+        # Override environment variable
+        export RECCE_ORGANIZATION_ID=8
+        recce cloud list-projects --organization 10
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from recce.exceptions import RecceConfigException
+    from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
+    from recce.util.recce_cloud import RecceCloudException
+
+    console = Console()
+    handle_debug_flag(**kwargs)
+
+    try:
+        api_token = prepare_api_token(**kwargs)
+    except RecceConfigException:
+        show_invalid_api_token_message()
+        exit(1)
+
+    organization = kwargs.get("organization")
+    if not organization:
+        console.print("[[red]Error[/red]] Organization ID is required. Please provide it via:")
+        console.print("  --organization <id> or set RECCE_ORGANIZATION_ID environment variable")
+        exit(1)
+
+    try:
+        from recce.util.recce_cloud import RecceCloud
+
+        cloud = RecceCloud(api_token)
+        projects = cloud.list_projects(organization)
+
+        if not projects:
+            console.print(f"No projects found in organization {organization}.")
+            return
+
+        table = Table(title=f"Projects in Organization {organization}")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="green")
+        table.add_column("Display Name", style="yellow")
+
+        for project in projects:
+            table.add_row(str(project.get("id", "")), project.get("name", ""), project.get("display_name", ""))
+
+        console.print(table)
+
+    except RecceCloudException as e:
+        console.print(f"[[red]Error[/red]] {e}")
+        exit(1)
+    except Exception as e:
+        console.print(f"[[red]Error[/red]] {e}")
+        exit(1)
+
+
+@cloud.command(cls=TrackCommand, name="list-sessions")
+@click.option(
+    "--organization",
+    "-o",
+    help="Organization ID (can also be set via RECCE_ORGANIZATION_ID environment variable)",
+    type=click.STRING,
+    envvar="RECCE_ORGANIZATION_ID",
+)
+@click.option(
+    "--project",
+    "-p",
+    help="Project ID (can also be set via RECCE_PROJECT_ID environment variable)",
+    type=click.STRING,
+    envvar="RECCE_PROJECT_ID",
+)
+@click.option("--api-token", help="The Recce Cloud API token.", type=click.STRING, envvar="RECCE_API_TOKEN")
+@add_options(recce_options)
+def list_sessions(**kwargs):
+    """
+    List sessions from Recce Cloud
+
+    Lists all sessions in the specified project that the authenticated user has access to.
+
+    Examples:
+
+        # Using environment variables
+        export RECCE_ORGANIZATION_ID=8
+        export RECCE_PROJECT_ID=7
+        recce cloud list-sessions
+
+        # Using command line arguments
+        recce cloud list-sessions --organization 8 --project 7
+
+        # Mixed usage (env + CLI override)
+        export RECCE_ORGANIZATION_ID=8
+        recce cloud list-sessions --project 7
+
+        # Override environment variables
+        export RECCE_ORGANIZATION_ID=8
+        export RECCE_PROJECT_ID=7
+        recce cloud list-sessions --organization 10 --project 9
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from recce.exceptions import RecceConfigException
+    from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
+    from recce.util.recce_cloud import RecceCloudException
+
+    console = Console()
+    handle_debug_flag(**kwargs)
+
+    try:
+        api_token = prepare_api_token(**kwargs)
+    except RecceConfigException:
+        show_invalid_api_token_message()
+        exit(1)
+
+    organization = kwargs.get("organization")
+    project = kwargs.get("project")
+
+    # Validate required parameters
+    if not organization:
+        console.print("[[red]Error[/red]] Organization ID is required. Please provide it via:")
+        console.print("  --organization <id> or set RECCE_ORGANIZATION_ID environment variable")
+        exit(1)
+
+    if not project:
+        console.print("[[red]Error[/red]] Project ID is required. Please provide it via:")
+        console.print("  --project <id> or set RECCE_PROJECT_ID environment variable")
+        exit(1)
+
+    try:
+        from recce.util.recce_cloud import RecceCloud
+
+        cloud = RecceCloud(api_token)
+        sessions = cloud.list_sessions(organization, project)
+
+        if not sessions:
+            console.print(f"No sessions found in project {project}.")
+            return
+
+        table = Table(title=f"Sessions in Project {project}")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="green")
+        table.add_column("Is Base", style="yellow")
+
+        for session in sessions:
+            is_base = "✓" if session.get("is_base", False) else ""
+            table.add_row(session.get("id", ""), session.get("name", ""), is_base)
+
+        console.print(table)
+
+    except RecceCloudException as e:
+        console.print(f"[[red]Error[/red]] {e}")
+        exit(1)
+    except Exception as e:
+        console.print(f"[[red]Error[/red]] {e}")
+        exit(1)
 
 
 @cli.group("github", short_help="GitHub related commands", hidden=True)
@@ -1235,13 +2080,22 @@ def artifact(**kwargs):
 @cli.command(cls=TrackCommand)
 @click.argument("state_file", type=click.Path(exists=True))
 @click.option(
-    "--api-token", help="The personal token generated by Recce Cloud.", type=click.STRING, envvar="RECCE_API_TOKEN"
+    "--api-token",
+    help="The personal token generated by Recce Cloud.",
+    type=click.STRING,
+    envvar="RECCE_API_TOKEN",
 )
 def share(state_file, **kwargs):
     """
     Share the state file
     """
+    from click import Abort
     from rich.console import Console
+
+    from recce.exceptions import RecceConfigException
+    from recce.state import RecceShareStateManager
+    from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
+    from recce.util.recce_cloud import RecceCloudException
 
     console = Console()
     handle_debug_flag(**kwargs)
@@ -1263,6 +2117,7 @@ def share(state_file, **kwargs):
     state_loader = create_state_loader(
         review_mode=True, cloud_mode=False, state_file=state_file, cloud_options=cloud_options
     )
+    state_loader.load()
 
     if not state_loader.verify():
         error, hint = state_loader.error_and_hint
@@ -1293,6 +2148,105 @@ def share(state_file, **kwargs):
         exit(1)
 
 
+snapshot_id_option = click.option(
+    "--snapshot-id",
+    help="The snapshot ID to upload artifacts to cloud.",
+    type=click.STRING,
+    envvar=["RECCE_SNAPSHOT_ID", "RECCE_SESSION_ID"],
+    required=True,
+)
+
+session_id_option = click.option(
+    "--session-id",
+    help="The session ID to upload artifacts to cloud.",
+    type=click.STRING,
+    envvar=["RECCE_SESSION_ID", "RECCE_SNAPSHOT_ID"],
+    required=True,
+)
+
+target_path_option = click.option(
+    "--target-path",
+    help="dbt artifacts directory for your artifacts.",
+    type=click.STRING,
+    default="target",
+    show_default=True,
+)
+
+
+@cli.command(cls=TrackCommand, hidden=True)
+@add_options([session_id_option, target_path_option])
+@add_options(recce_cloud_auth_options)
+@add_options(recce_options)
+def upload_session(**kwargs):
+    """
+    Upload target/manifest.json and target/catalog.json to the specific session ID
+
+    Upload the dbt artifacts (manifest.json, catalog.json) to Recce Cloud for the given session ID.
+    This allows you to associate artifacts with a specific session for later use.
+
+    Examples:\n
+
+    \b
+    # Upload artifacts to a session ID
+    recce upload-session --session-id <session-id>
+
+    \b
+    # Upload artifacts from custom target path to a session ID
+    recce upload-session --session-id <session-id> --target-path my-target
+    """
+    from rich.console import Console
+
+    from recce.artifact import upload_artifacts_to_session
+    from recce.config import RecceConfig
+    from recce.exceptions import RecceConfigException
+    from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
+
+    console = Console()
+    handle_debug_flag(**kwargs)
+
+    # Initialize Recce Config
+    RecceConfig(config_file=kwargs.get("config"))
+
+    try:
+        api_token = prepare_api_token(**kwargs)
+    except RecceConfigException:
+        show_invalid_api_token_message()
+        exit(1)
+
+    session_id = kwargs.get("session_id")
+    target_path = kwargs.get("target_path")
+
+    try:
+        rc = upload_artifacts_to_session(
+            target_path, session_id=session_id, token=api_token, debug=kwargs.get("debug", False)
+        )
+        console.rule("Uploaded Successfully")
+        console.print(
+            f'Uploaded dbt artifacts to Recce Cloud for session ID "{session_id}" from "{os.path.abspath(target_path)}"'
+        )
+    except Exception as e:
+        console.rule("Failed to Upload Session", style="red")
+        console.print(f"[[red]Error[/red]] Failed to upload the dbt artifacts to the session {session_id}.")
+        console.print(f"Reason: {e}")
+        rc = 1
+    return rc
+
+
+# Backward compatibility for `recce snapshot` command
+@cli.command(
+    cls=TrackCommand,
+    hidden=True,
+    deprecated=True,
+    help="Upload target/manifest.json and target/catalog.json to the specific snapshot ID",
+)
+@add_options([snapshot_id_option, target_path_option])
+@add_options(recce_cloud_auth_options)
+@add_options(recce_options)
+def snapshot(**kwargs):
+    kwargs["session_id"] = kwargs.get("snapshot_id")
+    return upload_session(**kwargs)
+
+
 @cli.command(hidden=True, cls=TrackCommand)
 @click.argument("state_file", required=True)
 @click.option("--host", default="localhost", show_default=True, help="The host to bind to.")
@@ -1301,9 +2255,231 @@ def share(state_file, **kwargs):
 @click.option("--share-url", help="The share URL triggers this instance.", type=click.STRING, envvar="RECCE_SHARE_URL")
 @click.pass_context
 def read_only(ctx, state_file=None, **kwargs):
+    from recce.server import RecceServerMode
+
     # Invoke `recce server --mode read-only <state_file> ...
     kwargs["mode"] = RecceServerMode.read_only
     ctx.invoke(server, state_file=state_file, **kwargs)
+
+
+@cli.command(cls=TrackCommand)
+@click.argument("state_file", required=False)
+@click.option("--sse", is_flag=True, default=False, help="Start in HTTP/SSE mode instead of stdio mode")
+@click.option("--host", default="localhost", help="Host to bind to in SSE mode (default: localhost)")
+@click.option("--port", default=8000, type=int, help="Port to bind to in SSE mode (default: 8000)")
+@add_options(dbt_related_options)
+@add_options(sqlmesh_related_options)
+@add_options(recce_options)
+@add_options(recce_dbt_artifact_dir_options)
+@add_options(recce_cloud_options)
+@add_options(recce_cloud_auth_options)
+@add_options(recce_hidden_options)
+def mcp_server(state_file, sse, host, port, **kwargs):
+    """
+    Start the Recce MCP (Model Context Protocol) server
+
+    The MCP server provides an interface for AI assistants and tools to interact
+    with Recce's data validation capabilities. By default, it uses stdio for
+    communication. Use --sse to enable HTTP/Server-Sent Events mode instead.
+
+    STATE_FILE is the path to the recce state file (optional).
+
+    \b
+    Prerequisites:
+        Development dbt artifacts (target/) must exist before starting.
+        Base artifacts (target-base/) are recommended for full diffing.
+        - Development: dbt docs generate            (creates target/)
+        - Base: dbt docs generate --target-path target-base
+                                                     (creates target-base/)
+        Without base artifacts, the server starts in single-environment
+        mode where diff tools compare the current environment against
+        itself (no changes expected).
+
+    \b
+    Available tools:
+        The MCP server provides tools for lineage exploration, schema
+        inspection, data diffing, and check management. The available
+        tools depend on the server mode (server vs preview/read-only).
+        See full list: https://docs.reccehq.com/setup-guides/mcp-server/#available-tools
+
+    Examples:\n
+
+    \b
+    # Start the MCP server in stdio mode (default)
+    recce mcp-server
+
+    \b
+    # Start with a state file
+    recce mcp-server recce_state.json
+
+    \b
+    # Start in HTTP/SSE mode on default port 8000
+    recce mcp-server --sse
+
+    \b
+    # Start in HTTP/SSE mode with custom host and port
+    recce mcp-server --sse --host 0.0.0.0 --port 9000
+
+    SSE Connection URL (when using --sse): http://<host>:<port>/sse
+    """
+    import asyncio
+
+    from rich.console import Console
+
+    from recce.config import RecceConfig
+    from recce.exceptions import RecceConfigException
+    from recce.util.api_token import prepare_api_token, show_invalid_api_token_message
+
+    # In stdio mode, stdout is the JSON-RPC transport — all human-readable
+    # output must go to stderr to avoid MCP client parse errors.
+    console = Console(stderr=True) if not sse else Console()
+    try:
+        # Import here to avoid import errors if mcp is not installed
+        from recce.mcp_server import run_mcp_server
+    except ImportError as e:
+        console.print(f"[[red]Error[/red]] Failed to import MCP server: {e}")
+        console.print(r"Please install the MCP package: pip install 'recce\[mcp]'")
+        exit(1)
+
+    # Initialize Recce Config
+    RecceConfig(config_file=kwargs.get("config"))
+
+    handle_debug_flag(**kwargs)
+    patch_derived_args(kwargs)
+
+    # Prepare API token
+    try:
+        api_token = prepare_api_token(**kwargs)
+        kwargs["api_token"] = api_token
+    except RecceConfigException:
+        show_invalid_api_token_message()
+        exit(1)
+
+    # Create state loader using shared function (for cloud mode or when state_file is provided)
+    is_cloud = kwargs.get("cloud", False)
+    if is_cloud or state_file:
+        state_loader = create_state_loader_by_args(state_file, **kwargs)
+        kwargs["state_loader"] = state_loader
+
+    # Check Single Environment Onboarding Mode
+    # When target-base/ doesn't exist, fall back to single-env mode:
+    # set target_base_path = target_path so both envs load the same artifacts,
+    # making all diffs show no changes. The MCP server adds _warning to responses.
+    if not is_cloud:
+        project_dir_path = Path(kwargs.get("project_dir") or "./")
+        target_base_path = project_dir_path.joinpath(Path(kwargs.get("target_base_path", "target-base")))
+        if not target_base_path.is_dir():
+            kwargs["single_env"] = True
+            kwargs["target_base_path"] = kwargs.get("target_path")
+            console.print(
+                "[yellow]Base artifacts not found. "
+                "Starting in single-environment mode (diffs will show no changes).[/yellow]"
+            )
+            console.print("To enable diffing: dbt docs generate --target-path target-base")
+
+    try:
+        if sse:
+            console.print(f"Starting Recce MCP Server in HTTP/SSE mode on {host}:{port}...")
+            console.print(f"SSE endpoint: http://{host}:{port}/sse")
+        else:
+            console.print("Starting Recce MCP Server in stdio mode...")
+
+        # Run the server (stdio or SSE based on --sse flag)
+        asyncio.run(run_mcp_server(sse=sse, host=host, port=port, **kwargs))
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # Graceful shutdown (e.g., Ctrl+C)
+        console.print("[yellow]MCP Server interrupted[/yellow]")
+        exit(0)
+    except Exception as e:
+        console.print(f"[[red]Error[/red]] Failed to start MCP server: {e}")
+        if kwargs.get("debug"):
+            import traceback
+
+            traceback.print_exc()
+        exit(1)
+
+
+@cli.group("cache", short_help="Manage column-level lineage cache.")
+def cache():
+    """Manage column-level lineage cache."""
+    pass
+
+
+@cache.command(cls=TrackCommand)
+@click.option(
+    "--cache-db",
+    help="Path to the column-level lineage cache database.",
+    type=click.Path(),
+    default=None,
+    show_default=False,
+)
+def stats(cache_db):
+    """Show column-level lineage cache statistics."""
+    from rich.console import Console
+
+    from recce.util.cll import _DEFAULT_DB_PATH, CllCache
+
+    console = Console()
+
+    if cache_db is None:
+        cache_db = _DEFAULT_DB_PATH
+
+    if not os.path.exists(cache_db):
+        console.print(f"Cache database not found: {cache_db}")
+        console.print("0 entries")
+        return
+
+    c = CllCache(db_path=cache_db)
+    s = c.stats
+    file_size = os.path.getsize(cache_db)
+    console.print(f"Cache: {cache_db}")
+    console.print(f"{s['entries']} entries, {file_size / 1024:.1f} KB")
+
+
+@cache.command(name="clear", cls=TrackCommand)
+@click.option(
+    "--cache-db",
+    help="Path to the column-level lineage cache database.",
+    type=click.Path(),
+    default=None,
+    show_default=False,
+)
+def clear_cache(cache_db):
+    """Delete the column-level lineage cache database file."""
+    from rich.console import Console
+
+    from recce.util.cll import _DEFAULT_DB_PATH
+
+    console = Console()
+
+    if cache_db is None:
+        cache_db = _DEFAULT_DB_PATH
+
+    if not os.path.exists(cache_db):
+        console.print(f"No cache file found at {cache_db}")
+        return
+
+    try:
+        os.remove(cache_db)
+    except FileNotFoundError:
+        console.print(f"Cache file was already removed: {cache_db}")
+        return
+    except PermissionError:
+        console.print(f"[[red]Error[/red]] Permission denied: cannot delete {cache_db}")
+        exit(1)
+    except OSError as e:
+        console.print(f"[[red]Error[/red]] Failed to delete cache: {e}")
+        exit(1)
+    console.print(f"Deleted cache: {cache_db}")
+
+    # Clean up SQLite WAL/SHM sidecar files
+    for suffix in ("-wal", "-shm"):
+        sidecar = cache_db + suffix
+        if os.path.exists(sidecar):
+            try:
+                os.remove(sidecar)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
